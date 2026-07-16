@@ -16,6 +16,7 @@ except ImportError:
     import inquirer
 
 # --- CONFIGURACIÓN ---
+VERSION = "v1.0.0"
 DIR_USB_BACKUPS = Path(__file__).resolve().parent / "copy4me_backups"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', 'env', '.idea', '.vscode'}
@@ -31,16 +32,32 @@ logging.basicConfig(
 
 def mostrar_logo():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print("\033[96m")
-    print(r'''
-        ____ ___  ____  _    _ _  _    _     _____ 
-       / ___/ _ \|  _ \| | | | | | |/ |   | ____|
-      | |  | | | | |_) | |_| | |_| |/ |___|  _|  
-      | |__| |_| |  __/ \__, |___  _|| |___| |___ 
-       \____\___/|_|    |___/    |_| |_|   |_____|
-    ''')
-    print(f"    [ SINCRONIZADOR OPTIMIZADO MULTIPLATAFORMA | MAX: {MAX_BACKUPS} ]")
-    print("\033[93m------------------------------------------------------------\033[0m")
+    
+    # Paleta de colores ANSI
+    cyan = "\033[96m"
+    verde = "\033[92m"
+    magenta = "\033[95m"
+    blanco = "\033[97m"
+    gris_oscuro = "\033[90m"
+    reset = "\033[0m"
+
+    # --- LOGO ALL4ME ---
+    print(cyan +    "      █████╗ ██╗      ██╗      ██╗  ██╗███╗   ███╗███████╗")
+    print(cyan +    "     ██╔══██╗██║      ██║      ██║  ██║████╗ ████║██╔════╝")
+    print(verde +   "     ███████║██║      ██║      ███████║██╔████╔██║█████╗  ")
+    print(verde +   "     ██╔══██║██║      ██║      ╚════██║██║╚██╔╝██║██╔══╝  ")
+    print(magenta + "     ██║  ██║███████╗███████╗      ██║██║ ╚═╝ ██║███████╗")
+    print(magenta + "     ╚═╝  ╚═╝╚══════╝╚══════╝      ╚═╝╚═╝     ╚═╝╚══════╝")
+    print("")
+  
+    # --- USB COPY4ME (Alineación exacta de 56 caracteres de ancho) ---
+    print(cyan +        "               _________________________________________")
+    print(cyan +        "    [ PC-1 ]       C  O  P  Y  ◄─── 4 ───►  M  E         [ PC-2 ]")
+    print(cyan +        "      📂       ==  ==  ==  ==  ==  ==  ==  ==  ==  ==       📂")
+    print(cyan +        "    Directo          S i n c r o n i z a d o r           Respaldado")
+    print(cyan +        "               __________________________________________")
+    print(f"\n                   Versión: {VERSION} | Max Backups: {MAX_BACKUPS}")
+    print("\033[93m   ------------------------------------------------------------\033[0m\n")
 
 def seleccionar_opcion(titulo, opciones):
     preguntas = [
