@@ -12,26 +12,39 @@ try:
     import inquirer
 except ImportError:
     print("Instalando librería de interfaz interactiva...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "inquirer"])
-    import inquirer
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "inquirer"])
+        import inquirer
+    except Exception as e:
+        print(f"❌ No se pudo instalar 'inquirer' automáticamente: {e}")
+        print("Por favor, instálalo manualmente ejecutando: pip install inquirer")
+        sys.exit(1)
 
 # --- CONFIGURACIÓN ---
-VERSION = "v1.0.0"
+VERSION = "v1.2"  # Incremento de versión por mejoras de robustez
 DIR_USB_BACKUPS = Path(__file__).resolve().parent / "copy4me_backups"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', 'env', '.idea', '.vscode'}
 
 # Configurar Logging
-DIR_USB_BACKUPS.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    filename=DIR_USB_BACKUPS / "sync_history.log",
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+try:
+    DIR_USB_BACKUPS.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        filename=DIR_USB_BACKUPS / "sync_history.log",
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        encoding='utf-8' # Forzar UTF-8 para evitar fallos de codificación en logs
+    )
+except Exception as e:
+    print(f"⚠️ No se pudo inicializar el archivo de log: {e}")
 
 def mostrar_logo():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    # Limpieza de pantalla segura
+    try:
+        os.system('cls' if os.name == 'nt' else 'clear')
+    except Exception:
+        pass
     
     # Paleta de colores ANSI
     cyan = "\033[96m"
@@ -50,7 +63,7 @@ def mostrar_logo():
     print(magenta + "     ╚═╝  ╚═╝╚══════╝╚══════╝      ╚═╝╚═╝     ╚═╝╚══════╝")
     print("")
   
-    # --- USB COPY4ME (Alineación exacta de 56 caracteres de ancho) ---
+    # --- USB COPY4ME ---
     print(cyan +        "               _________________________________________")
     print(cyan +        "    [ PC-1 ]       C  O  P  Y  ◄─── 4 ───►  M  E         [ PC-2 ]")
     print(cyan +        "      📂       ==  ==  ==  ==  ==  ==  ==  ==  ==  ==       📂")
@@ -63,46 +76,64 @@ def seleccionar_opcion(titulo, opciones):
     preguntas = [
         inquirer.List('opcion', message=titulo, choices=opciones, carousel=True)
     ]
-    respuestas = inquirer.prompt(preguntas)
-    if not respuestas:
-        sys.exit(0)
-    return respuestas['opcion']
+    try:
+        respuestas = inquirer.prompt(preguntas)
+        if not respuestas:
+            sys.exit(0)
+        return respuestas['opcion']
+    except Exception as e:
+        logging.error(f"Error en la interfaz de selección: {e}")
+        print("\n❌ Error en el menú interactivo.")
+        sys.exit(1)
 
 def obtener_tamano_formateado(ruta):
-    """Calcula el tamaño de un directorio o archivo ZIP."""
-    if ruta.is_file():
-        total_size = ruta.stat().st_size
-    else:
-        total_size = 0
-        for dirpath, _, filenames in os.walk(ruta):
-            for f in filenames:
-                fp = os.path.join(dirpath, f)
-                if not os.path.islink(fp):
-                    total_size += os.path.getsize(fp)
-    
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if total_size < 1024.0:
-            return f"{total_size:.2f} {unit}"
-        total_size /= 1024.0
+    """Calcula el tamaño de un directorio o archivo ZIP con manejo de errores."""
+    try:
+        if ruta.is_file():
+            total_size = ruta.stat().st_size
+        else:
+            total_size = 0
+            for dirpath, _, filenames in os.walk(ruta):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    if not os.path.islink(fp):
+                        try:
+                            total_size += os.path.getsize(fp)
+                        except (OSError, PermissionError):
+                            continue # Omitir archivos inaccesibles al calcular tamaño
+        
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if total_size < 1024.0:
+                return f"{total_size:.2f} {unit}"
+            total_size /= 1024.0
+    except Exception:
+        return "Tamaño desconocido"
 
 def crear_backup_zip(origen, destino_zip):
-    """Crea un archivo ZIP comprimido para ahorrar espacio en los históricos."""
+    """Crea un archivo ZIP comprimido controlando errores individuales de archivos."""
     try:
         with zipfile.ZipFile(destino_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(origen):
                 dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
                 for file in files:
                     ruta_completa = Path(root) / file
-                    zipf.write(ruta_completa, ruta_completa.relative_to(origen))
+                    try:
+                        zipf.write(ruta_completa, ruta_completa.relative_to(origen))
+                    except (PermissionError, FileNotFoundError) as fe:
+                        logging.warning(f"Omitido del ZIP por falta de acceso/bloqueo: {ruta_completa} ({fe})")
         return True
     except Exception as e:
-        logging.error(f"Error creando ZIP {destino_zip}: {e}")
+        logging.error(f"Error crítico creando ZIP {destino_zip}: {e}")
         return False
 
 def navegador_archivos(titulo_prompt="Selecciona una carpeta:"):
-    ruta_actual = Path('C:\\') if os.name == 'nt' else Path('/')
-    if not ruta_actual.exists():
-        ruta_actual = Path.cwd().root
+    # Inicialización robusta del directorio raíz
+    try:
+        ruta_actual = Path('C:\\') if os.name == 'nt' else Path('/')
+        if not ruta_actual.exists():
+            ruta_actual = Path.cwd().root
+    except Exception:
+        ruta_actual = Path.cwd()
 
     while True:
         mostrar_logo()
@@ -114,7 +145,12 @@ def navegador_archivos(titulo_prompt="Selecciona una carpeta:"):
         except PermissionError:
             print("\033[91m⚠️ Sin permisos para acceder a esta carpeta.\033[0m")
             input("\nPresiona ENTER para volver atrás...")
-            ruta_actual = ruta_actual.parent
+            ruta_actual = ruta_actual.parent if ruta_actual.parent != ruta_actual else Path.cwd()
+            continue
+        except Exception as e:
+            print(f"\033[91m⚠️ Error al leer directorio: {e}\033[0m")
+            input("\nPresiona ENTER para ir al directorio de trabajo actual...")
+            ruta_actual = Path.cwd()
             continue
 
         opciones = ["[ SELECCIONAR ESTA CARPETA ]", ".. (Ir atrás)"]
@@ -132,8 +168,12 @@ def navegador_archivos(titulo_prompt="Selecciona una carpeta:"):
                 ruta_actual = ruta_actual.parent
         elif eleccion == "[ Cambiar de Unidad de Disco ]":
             unidades = [f"{d}:\\" for d in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' if os.path.exists(f"{d}:\\")]
-            unidad_elegida = seleccionar_opcion("Selecciona unidad de disco:", unidades)
-            ruta_actual = Path(unidad_elegida)
+            if unidades:
+                unidad_elegida = seleccionar_opcion("Selecciona unidad de disco:", unidades)
+                ruta_actual = Path(unidad_elegida)
+            else:
+                print("\033[91mNo se detectaron otras unidades de disco.\033[0m")
+                input("\nPresiona ENTER para continuar...")
         else:
             nombre_carpeta = eleccion.replace("📁 ", "")
             ruta_actual = ruta_actual / nombre_carpeta
@@ -144,7 +184,6 @@ def gestionar_rotacion_backups(nombre_carpeta):
     if not carpeta_historico.exists():
         return
 
-    # Buscar tanto carpetas de backup antiguas como los nuevos archivos ZIP
     backups_existentes = sorted(
         [d for d in carpeta_historico.iterdir() if d.name.startswith("backup_")],
         key=lambda x: x.stat().st_mtime
@@ -162,6 +201,7 @@ def gestionar_rotacion_backups(nombre_carpeta):
             logging.info(msg)
         except Exception as e:
             print(f"⚠️ No se pudo borrar el backup antiguo {antiguo.name}: {e}")
+            logging.error(f"Fallo al eliminar backup antiguo {antiguo.name}: {e}")
 
 def ver_y_gestionar_copias():
     while True:
@@ -196,7 +236,10 @@ def ver_y_gestionar_copias():
             opciones_copias = []
             for copia in copias:
                 tamano = obtener_tamano_formateado(copia)
-                fecha = datetime.fromtimestamp(copia.stat().st_mtime).strftime("%d/%m/%Y %H:%M")
+                try:
+                    fecha = datetime.fromtimestamp(copia.stat().st_mtime).strftime("%d/%m/%Y %H:%M")
+                except Exception:
+                    fecha = "Fecha desconocida"
                 icono = "📁" if copia.is_dir() else "📦"
                 etiqueta = f"{icono} {copia.name} | 📅 {fecha} | 💾 {tamano}"
                 opciones_copias.append(etiqueta)
@@ -219,12 +262,16 @@ def ver_y_gestionar_copias():
             if accion == "🗑️ Eliminar esta copia":
                 confirmacion = seleccionar_opcion("¿Estás seguro?", ["Sí, eliminar", "No, cancelar"])
                 if confirmacion == "Sí, eliminar":
-                    if ruta_copia_exacta.is_dir():
-                        shutil.rmtree(ruta_copia_exacta)
-                    else:
-                        ruta_copia_exacta.unlink()
-                    print(f"\033[92mCopia eliminada exitosamente.\033[0m")
-                    logging.info(f"Usuario eliminó manualmente la copia: {ruta_copia_exacta.name}")
+                    try:
+                        if ruta_copia_exacta.is_dir():
+                            shutil.rmtree(ruta_copia_exacta)
+                        else:
+                            ruta_copia_exacta.unlink()
+                        print(f"\033[92mCopia eliminada exitosamente.\033[0m")
+                        logging.info(f"Usuario eliminó manualmente la copia: {ruta_copia_exacta.name}")
+                    except Exception as e:
+                        print(f"\033[91m❌ No se pudo eliminar la copia: {e}\033[0m")
+                        logging.error(f"Error al eliminar copia manual {ruta_copia_exacta.name}: {e}")
                     input("\nPresiona ENTER para continuar...")
                     copias = sorted([d for d in carpeta_proyecto.iterdir() if d.name.startswith("backup_")], key=lambda x: x.stat().st_mtime, reverse=True)
                     if not copias:
@@ -236,9 +283,19 @@ def copiar_sincronizada(origen, destino, modo_espejo=False):
     destino = Path(destino)
     archivos_copiados = 0
     archivos_eliminados = 0
+    errores_encontrados = 0
     
     print("\033[93m🔍 Escaneando archivos y calculando tamaño del proyecto...\033[0m")
     
+    # Control preventivo de espacio en disco de destino
+    try:
+        uso_destino = shutil.disk_usage(destino.anchor if destino.anchor else destino.parent)
+        if uso_destino.free < 50 * 1024 * 1024:  # Menos de 50MB libres
+            print("\033[91m⚠️ ¡ALERTA!: El espacio en la unidad de destino es extremadamente bajo.\033[0m")
+            input("Presiona ENTER si deseas continuar bajo tu propio riesgo...")
+    except Exception:
+        pass # Ignorar si no se puede leer el uso de disco
+
     todos_los_elementos = []
     for root, dirs, files in os.walk(origen):
         dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
@@ -260,28 +317,43 @@ def copiar_sincronizada(origen, destino, modo_espejo=False):
                 relativa = ruta_dest.relative_to(destino)
                 ruta_orig = origen / relativa
                 if not ruta_orig.exists():
-                    ruta_dest.unlink()
-                    archivos_eliminados += 1
+                    try:
+                        ruta_dest.unlink()
+                        archivos_eliminados += 1
+                    except Exception as e:
+                        logging.warning(f"No se pudo eliminar el archivo obsoleto {ruta_dest}: {e}")
 
+    porcentaje_anterior = -1
     try:
         for indice, item in enumerate(todos_los_elementos, 1):
             relativa = item.relative_to(origen)
             target = destino / relativa
             
-            if not target.exists() or item.stat().st_mtime > target.stat().st_mtime:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(item, target)
-                archivos_copiados += 1
+            # Copiar únicamente si es necesario
+            try:
+                if not target.exists() or item.stat().st_mtime > target.stat().st_mtime:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(item, target)
+                    archivos_copiados += 1
+            except (PermissionError, FileNotFoundError, OSError) as ferr:
+                errores_encontrados += 1
+                logging.error(f"Error al copiar {item} -> {target}: {ferr}")
                 
+            # Optimización de la terminal (Throttling): Actualiza la pantalla solo si el porcentaje cambia
             porcentaje = int((indice / total_archivos) * 100) if total_archivos > 0 else 100
-            bloques = int(porcentaje / 5)
-            barra = "█" * bloques + "░" * (20 - bloques)
-            
-            sys.stdout.write(f"\r⚡ Sincronizando: [{barra}] {porcentaje}% ({indice}/{total_archivos}) | Copiados: {archivos_copiados} | Borrados: {archivos_eliminados}")
-            sys.stdout.flush()
+            if porcentaje != porcentaje_anterior or indice == total_archivos:
+                porcentaje_anterior = porcentaje
+                bloques = int(porcentaje / 5)
+                barra = "█" * bloques + "░" * (20 - bloques)
+                sys.stdout.write(f"\r⚡ Sincronizando: [{barra}] {porcentaje}% ({indice}/{total_archivos}) | Copiados: {archivos_copiados} | Borrados: {archivos_eliminados}")
+                sys.stdout.flush()
             
         print("\n")
-        logging.info(f"Sincronización completada. Origen: {origen.name} | Copiados: {archivos_copiados} | Borrados: {archivos_eliminados}")
+        if errores_encontrados > 0:
+            print(f"\033[93m⚠️ Sincronización finalizada con {errores_encontrados} advertencias (archivos bloqueados u omitidos).\033[0m")
+            print("Revisa el archivo 'sync_history.log' para ver los detalles.")
+        
+        logging.info(f"Sincronización completada. Origen: {origen.name} | Copiados: {archivos_copiados} | Borrados: {archivos_eliminados} | Errores: {errores_encontrados}")
         return archivos_copiados, archivos_eliminados
 
     except KeyboardInterrupt:
@@ -289,6 +361,7 @@ def copiar_sincronizada(origen, destino, modo_espejo=False):
         return archivos_copiados, archivos_eliminados
     except Exception as e:
         print(f"\n\n\033[91m❌ Error inesperado durante la copia: {e}\033[0m")
+        logging.critical(f"Excepción grave en copiar_sincronizada: {e}", exc_info=True)
         return archivos_copiados, archivos_eliminados
 
 # --- ACCIÓN 1: PC -> USB ---
@@ -361,7 +434,15 @@ def descargar_del_usb():
     ])
     modo_espejo = "Modo Espejo" in modo
 
-    if any(dir_destino.iterdir()):
+    # Verificar de forma robusta si el directorio contiene algo además de sí mismo
+    destino_tiene_archivos = False
+    try:
+        if dir_destino.exists():
+            destino_tiene_archivos = any(dir_destino.iterdir())
+    except Exception:
+        pass
+
+    if destino_tiene_archivos:
         print("\033[93mLa carpeta del PC no está vacía. Creando resguardo en .ZIP en el USB...\033[0m")
         gestionar_rotacion_backups(proyecto_elegido)
         fecha_pc = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -383,26 +464,34 @@ def descargar_del_usb():
 # --- BUCLE PRINCIPAL ---
 def main():
     while True:
-        mostrar_logo()
-        menu_principal = [
-            "📥 1. Guardar cambios en el USB (PC -> USB)",
-            "📤 2. Descargar/Actualizar este PC (USB -> PC)",
-            "🔍 3. Ver y gestionar copias guardadas",
-            "❌ 4. Salir"
-        ]
-        
-        seleccion = seleccionar_opcion("¿Qué acción deseas realizar?", menu_principal)
-        
-        if "1." in seleccion:
-            subir_al_usb()
-        elif "2." in seleccion:
-            descargar_del_usb()
-        elif "3." in seleccion:
-            ver_y_gestionar_copias()
-        elif "4." in seleccion:
-            print("\033[92m¡Sincronización terminada! Ya puedes retirar tu USB. ¡Adiós!\033[0m")
-            logging.info("Sesión finalizada por el usuario.")
+        try:
+            mostrar_logo()
+            menu_principal = [
+                "📥 1. Guardar cambios en el USB (PC -> USB)",
+                "📤 2. Descargar/Actualizar este PC (USB -> PC)",
+                "🔍 3. Ver y gestionar copias guardadas",
+                "❌ 4. Salir"
+            ]
+            
+            seleccion = seleccionar_opcion("¿Qué acción deseas realizar?", menu_principal)
+            
+            if "1." in seleccion:
+                subir_al_usb()
+            elif "2." in seleccion:
+                descargar_del_usb()
+            elif "3." in seleccion:
+                ver_y_gestionar_copias()
+            elif "4." in seleccion:
+                print("\033[92m¡Sincronización terminada! Ya puedes retirar tu USB. ¡Adiós!\033[0m")
+                logging.info("Sesión finalizada por el usuario.")
+                sys.exit(0)
+        except KeyboardInterrupt:
+            print("\n\n\033[92m¡Sincronización finalizada abruptamente con Ctrl+C! Adiós.\033[0m")
             sys.exit(0)
+        except Exception as e:
+            logging.critical(f"Error general inesperado en el bucle principal: {e}", exc_info=True)
+            print(f"\033[91m⚠️ Ocurrió un error inesperado en el menú: {e}\033[0m")
+            input("\nPresiona ENTER para reiniciar el menú...")
 
 if __name__ == "__main__":
     main()
