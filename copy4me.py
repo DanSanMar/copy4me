@@ -78,9 +78,15 @@ except Exception as e:
 
 def limpiar_pantalla():
     try:
-        os.system('cls' if os.name == 'nt' else 'clear')
+        # En sistemas Windows modernos, Linux y macOS, reposiciona el cursor en el inicio (0,0)
+        # y limpia la pantalla desde ahí hacia abajo de manera progresiva y fluida, evitando el parpadeo.
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
     except Exception:
-        pass
+        try:
+            os.system('cls' if os.name == 'nt' else 'clear')
+        except Exception:
+            pass
 
 def mostrar_logo():
     # --- LOGO ALL4ME ---
