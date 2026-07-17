@@ -359,6 +359,7 @@ def ver_y_gestionar_copias():
                         break
 
 # --- COPIA INTELIGENTE ---
+# --- COPIA INTELIGENTE (VERBOSA) ---
 def copiar_sincronizada(origen, destino, modo_espejo=False):
     origen = Path(origen)
     destino = Path(destino)
@@ -397,6 +398,8 @@ def copiar_sincronizada(origen, destino, modo_espejo=False):
                 ruta_orig = origen / relativa
                 if not ruta_orig.exists():
                     try:
+                        # MODIFICACIÓN VERBOSA: Print de eliminación
+                        print(f"{Color.ROJO}🗑️ Eliminando obsoleto:{Color.RESET} {relativa}")
                         ruta_dest.unlink()
                         archivos_eliminados += 1
                     except Exception as e:
@@ -411,6 +414,8 @@ def copiar_sincronizada(origen, destino, modo_espejo=False):
             try:
                 if not target.exists() or item.stat().st_mtime > target.stat().st_mtime:
                     target.parent.mkdir(parents=True, exist_ok=True)
+                    # MODIFICACIÓN VERBOSA: Print de copia en tiempo real
+                    print(f"{Color.CYAN}📄 Copiando:{Color.RESET} {relativa}")
                     shutil.copy2(item, target)
                     archivos_copiados += 1
             except (PermissionError, FileNotFoundError, OSError) as ferr:
@@ -449,6 +454,8 @@ def subir_al_usb():
     
     dir_origen = navegador_archivos("Selecciona la carpeta origen en tu PC:")
     nombre_carpeta = dir_origen.name
+    
+    # El script define de forma automática e invisible la ruta blindada en el USB
     dir_master_usb = DIR_USB_BACKUPS / nombre_carpeta / "MASTER"
     
     modo = seleccionar_opcion("Selecciona la estrategia de sincronización en USB:", [
@@ -468,6 +475,7 @@ def subir_al_usb():
         else:
             print(f"{Color.AMARILLO}⚠️ No se pudo procesar la compresión. Continuando sin backup previo...{Color.RESET}")
 
+    # Creamos la ruta blindada de forma automática
     dir_master_usb.mkdir(parents=True, exist_ok=True)
     copiados, borrados = copiar_sincronizada(dir_origen, dir_master_usb, modo_espejo)
     
@@ -510,6 +518,12 @@ def descargar_del_usb():
     mostrar_logo()
     print(f"Determina la ruta de destino exacta para colocar '{proyecto_elegido}':\n")
     dir_destino = navegador_archivos(f"Selecciona la carpeta destino en tu PC para '{proyecto_elegido}':")
+
+    # --- LA MAGIA DEL ENCAPSULAMIENTO ESTÁ AQUÍ ---
+    # Asegura que la carpeta final lleve el nombre del proyecto, sin importar lo que elija el usuario
+    if dir_destino.name != proyecto_elegido:
+        dir_destino = dir_destino / proyecto_elegido
+    # ----------------------------------------------
 
     modo = seleccionar_opcion("Selecciona la estrategia de sincronización en tu PC:", [
         "🔄 Conservar todo (Suma archivos nuevos, no toca lo propio de tu ordenador)",
