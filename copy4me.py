@@ -1,386 +1,231 @@
 import os
 import sys
 import shutil
-import subprocess
 import logging
 import zipfile
+import json
+import socket
+import platform
+import threading
+import queue
+import time
 from datetime import datetime
 from pathlib import Path
 
-# --- SISTEMA DE ENTRADA NATIVA ---
+# --- CARGA DEFENSIVA DE GUI (FALLBACK A TUI) ---
+GUI_DISPONIBLE = False
 try:
-    import msvcrt
-    def obtener_tecla():
-        """Lee una tecla en Windows."""
-        ch = msvcrt.getch()
-        if ch in (b'\x00', b'\xe0'):  # Tecla especial (flechas)
-            ch2 = msvcrt.getch()
-            if ch2 == b'H': return "UP"
-            if ch2 == b'P': return "DOWN"
-        if ch == b'\r':
-            return "ENTER"
-        if ch == b'\x03':  # Ctrl+C
-            raise KeyboardInterrupt
-        return None
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog
+    GUI_DISPONIBLE = True
 except ImportError:
-    import tty
-    import termios
-    def obtener_tecla():
-        """Lee una tecla en Linux / macOS."""
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setraw(sys.stdin.fileno())
-            ch = sys.stdin.read(1)
-            if ch == '\x1b':  # Secuencia de escape (flechas)
-                ch2 = sys.stdin.read(2)
-                if ch2 == '[A': return "UP"
-                if ch2 == '[B': return "DOWN"
-            if ch == '\n' or ch == '\r':
-                return "ENTER"
-            if ch == '\x03':  # Ctrl+C
-                raise KeyboardInterrupt
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        return None
+    GUI_DISPONIBLE = False
 
-# --- CONFIGURACIÓN ---
-VERSION = "v1.6"  # Versión optimizada con menú expandido y rutas hiper-transparentes
-DIR_USB_BACKUPS = Path(__file__).resolve().parent / "copy4me_backups"
+# --- CONFIGURACIÓN Y CONSTANTES ---
+VERSION = "v2.6-Enterprise"
+
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
+
+DIR_USB_BACKUPS = BASE_DIR / "copy4me_backups"
+CONFIG_FILE = BASE_DIR / "config.json"
 MAX_BACKUPS = 10
-EXCLUDE_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', 'env', '.idea', '.vscode'}
+EXCLUDE_DIRS = {
+    '.git', 'node_modules', '__pycache__', '.venv', 'venv', 'env',
+    '.idea', '.vscode', 'System Volume Information', '$RECYCLE.BIN', '.Trash-1000'
+}
 
-# Paleta de colores ANSI
+# Metadatos del sistema local
+NOMBRE_EQUIPO = socket.gethostname()
+SISTEMA_OPERATIVO = f"{platform.system()} {platform.release()}"
+
+# --- PALETA DE COLORES ANSI Y BANNER CORREGIDO ---
 class Color:
     CYAN = "\033[96m"
     VERDE = "\033[92m"
     MAGENTA = "\033[95m"
     BLANCO = "\033[97m"
-    GRIS = "\033[90m"
     AMARILLO = "\033[93m"
     ROJO = "\033[91m"
     AZUL = "\033[94m"
     RESET = "\033[0m"
     BOLD = "\033[1m"
 
-# Configurar Logging
+BANNER_ASCII = f"""{Color.CYAN}      █████╗ ██╗      ██╗      ██╗  ██╗███╗   ███╗███████╗
+     ██╔══██╗██║      ██║      ██║  ██║████╗ ████║██╔════╝
+{Color.VERDE}     ███████║██║      ██║      ███████║██╔████╔██║█████╗  
+     ██╔══██║██║      ██║      ╚════██║██║╚██╔╝██║██╔══╝  
+{Color.MAGENTA}     ██║  ██║███████╗███████╗      ██║██║ ╚═╝ ██║███████╗
+     ╚═╝  ╚═╝╚══════╝╚══════╝      ╚═╝╚═╝     ╚═╝╚══════╝{Color.RESET}
+
+{Color.CYAN}               _________________________________________
+    [ PC-1 ]       C  O  P  Y  ◄─── 4 ───►  M  E         [ PC-2 ]
+      📂       ==  ==  ==  ==  ==  ==  ==  ==  ==  ==       📂
+    Directo          S i n c r o n i z a d o r           Respaldado
+               __________________________________________{Color.RESET}
+                   Versión: {Color.BOLD}{VERSION}{Color.RESET} | Max Backups: {Color.BOLD}{MAX_BACKUPS}{Color.RESET}
+                   Equipo Local: {Color.AZUL}{NOMBRE_EQUIPO}{Color.RESET} ({SISTEMA_OPERATIVO})
+{Color.AMARILLO}   ------------------------------------------------------------{Color.RESET}"""
+
+# --- LOGGING SEGURO ---
 try:
     DIR_USB_BACKUPS.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         filename=DIR_USB_BACKUPS / "sync_history.log",
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
+        format='%(asctime)s - %(levelname)s - [%(filename)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
         encoding='utf-8'
     )
 except Exception as e:
-    print(f"{Color.AMARILLO}⚠️ No se pudo inicializar el archivo de log: {e}{Color.RESET}")
+    print(f"⚠️ No se pudo inicializar el log: {e}")
 
-def limpiar_pantalla():
+# --- AYUDANTE DE RUTAS EN WINDOWS ---
+def adaptar_ruta_larga(ruta: Path) -> Path:
+    """Añade prefijo UNC para evitar límites de 260 caracteres en Windows."""
+    str_ruta = str(ruta.resolve())
+    if platform.system() == "Windows" and not str_ruta.startswith("\\\\?\\"):
+        return Path("\\\\?\\" + str_ruta)
+    return ruta
+
+# --- GESTIÓN DE CONFIGURACIÓN ---
+def cargar_configuracion():
+    if not CONFIG_FILE.exists():
+        return {"perfiles": {}}
     try:
-        sys.stdout.write("\033[H\033[J")
-        sys.stdout.flush()
-    except Exception:
-        try:
-            os.system('cls' if os.name == 'nt' else 'clear')
-        except Exception:
-            pass
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if "perfiles" not in data:
+                data["perfiles"] = {}
+            return data
+    except Exception as e:
+        logging.error(f"Error leyendo {CONFIG_FILE}: {e}")
+        return {"perfiles": {}}
 
-def mostrar_logo():
-    # --- LOGO ALL4ME ---
-    print(Color.CYAN +    "      █████╗ ██╗      ██╗      ██╗  ██╗███╗   ███╗███████╗")
-    print(Color.CYAN +    "     ██╔══██╗██║      ██║      ██║  ██║████╗ ████║██╔════╝")
-    print(Color.VERDE +   "     ███████║██║      ██║      ███████║██╔████╔██║█████╗  ")
-    print(Color.VERDE +   "     ██╔══██║██║      ██║      ╚════██║██║╚██╔╝██║██╔══╝  ")
-    print(Color.MAGENTA + "     ██║  ██║███████╗███████╗      ██║██║ ╚═╝ ██║███████╗")
-    print(Color.MAGENTA + "     ╚═╝  ╚═╝╚══════╝╚══════╝      ╚═╝╚═╝     ╚═╝╚══════╝" + Color.RESET)
-    print("")
-  
-    # --- USB COPY4ME ---
-    print(Color.CYAN +        "               _________________________________________")
-    print(Color.CYAN +        "    [ PC-1 ]       C  O  P  Y  ◄─── 4 ───►  M  E         [ PC-2 ]")
-    print(Color.CYAN +        "      📂       ==  ==  ==  ==  ==  ==  ==  ==  ==  ==       📂")
-    print(Color.CYAN +        "    Directo          S i n c r o n i z a d o r           Respaldado")
-    print(Color.CYAN +        "               __________________________________________" + Color.RESET)
-    print(f"\n                   Versión: {Color.BOLD}{VERSION}{Color.RESET} | Max Backups: {Color.BOLD}{MAX_BACKUPS}{Color.RESET}")
-    print(f"{Color.AMARILLO}   ------------------------------------------------------------{Color.RESET}\n")
+def guardar_configuracion(config):
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+        return True
+    except Exception as e:
+        logging.error(f"Error guardando {CONFIG_FILE}: {e}")
+        return False
 
-# --- SELECTOR INTERACTIVO ANTIPARPADEO Y ANTIDUPLICADO ---
-def seleccionar_opcion(titulo, opciones, bloque_cabecera=None):
-    seleccionado = 0
-    total = len(opciones)
-    
-    while True:
-        limpiar_pantalla()
-        mostrar_logo()
-        
-        if bloque_cabecera:
-            bloque_cabecera()
-            
-        print(f"{Color.BOLD}{titulo}{Color.RESET}\n")
-        
-        for i, opcion in enumerate(opciones):
-            if i == seleccionado:
-                print(f" {Color.VERDE}❯ {Color.BOLD}{opcion}{Color.RESET}")
-            else:
-                print(f"   {Color.GRIS}{opcion}{Color.RESET}")
-        
-        tecla = obtener_tecla()
-        
-        if tecla == "UP":
-            seleccionado = (seleccionado - 1) % total
-        elif tecla == "DOWN":
-            seleccionado = (seleccionado + 1) % total
-        elif tecla == "ENTER":
-            return opciones[seleccionado]
+def registrar_o_actualizar_perfil(nombre_perfil, ruta_local):
+    config = cargar_configuracion()
+    config["perfiles"][nombre_perfil] = {
+        "ruta_local": str(Path(ruta_local).resolve()),
+        "ultimo_equipo": NOMBRE_EQUIPO,
+        "sistema_operativo": SISTEMA_OPERATIVO,
+        "ultima_sincronizacion": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    guardar_configuracion(config)
+    return config
 
+# --- MOTOR DE COPIA Y RESPALDOS ---
 def obtener_tamano_formateado(ruta):
     try:
+        ruta = Path(ruta)
         if ruta.is_file():
             total_size = ruta.stat().st_size
         else:
-            total_size = 0
-            for dirpath, _, filenames in os.walk(ruta):
-                for f in filenames:
-                    fp = os.path.join(dirpath, f)
-                    if not os.path.islink(fp):
-                        try:
-                            total_size += os.path.getsize(fp)
-                        except (OSError, PermissionError):
-                            continue
-        
+            total_size = sum(
+                f.stat().st_size for f in ruta.glob('**/*') if f.is_file()
+            )
+
+        if total_size == 0:
+            return "0 B"
+
         for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
             if total_size < 1024.0:
                 return f"{total_size:.2f} {unit}"
             total_size /= 1024.0
+        return f"{total_size:.2f} PB"
     except Exception:
         return "Tamaño desconocido"
 
-def crear_backup_zip(origen, destino_zip):
-    try:
-        with zipfile.ZipFile(destino_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(origen):
-                dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
-                for file in files:
-                    ruta_completa = Path(root) / file
-                    try:
-                        zipf.write(ruta_completa, ruta_completa.relative_to(origen))
-                    except (PermissionError, FileNotFoundError) as fe:
-                        logging.warning(f"Omitido del ZIP por falta de acceso/bloqueo: {ruta_completa} ({fe})")
-        return True
-    except Exception as e:
-        logging.error(f"Error crítico creando ZIP {destino_zip}: {e}")
-        return False
-
-def navegador_archivos(titulo_prompt="Selecciona una carpeta:"):
-    try:
-        ruta_actual = Path('C:\\') if os.name == 'nt' else Path('/')
-        if not ruta_actual.exists():
-            ruta_actual = Path.cwd().root
-    except Exception:
-        ruta_actual = Path.cwd()
-
-    while True:
-        try:
-            subcarpetas = [d for d in ruta_actual.iterdir() if d.is_dir() and not d.name.startswith('.')]
-            subcarpetas.sort(key=lambda x: x.name.lower())
-        except PermissionError:
-            limpiar_pantalla()
-            mostrar_logo()
-            print(f"{Color.ROJO}⚠️ Sin permisos para acceder a esta carpeta.{Color.RESET}")
-            input("\nPresiona ENTER para volver atrás...")
-            ruta_actual = ruta_actual.parent if ruta_actual.parent != ruta_actual else Path.cwd()
-            continue
-        except Exception as e:
-            limpiar_pantalla()
-            mostrar_logo()
-            print(f"{Color.ROJO}⚠️ Error al leer directorio: {e}{Color.RESET}")
-            input("\nPresiona ENTER para ir al directorio de trabajo actual...")
-            ruta_actual = Path.cwd()
-            continue
-
-        opciones = [f"💾 [ SELECCIONAR ESTA CARPETA: {ruta_actual.name or ruta_actual} ]", "↩️ .. (Ir atrás)"]
-        if os.name == 'nt':
-            opciones.append("💽 [ Cambiar de Unidad de Disco ]")
-
-        opciones.extend([f"📁 {d.name}" for d in subcarpetas])
-        
-        def cabecera_explorador():
-            print(f"┌────────────────────────────────────────────────────────────")
-            print(f"│ {Color.AZUL}📍 EXPLORANDO ENTORNO LOCAL:{Color.RESET} {Color.BOLD}{ruta_actual}{Color.RESET}")
-            print(f"└────────────────────────────────────────────────────────────\n")
-
-        eleccion = seleccionar_opcion(titulo_prompt, opciones, bloque_cabecera=cabecera_explorador)
-        
-        if eleccion.startswith("💾 [ SELECCIONAR ESTA CARPETA"):
-            return ruta_actual
-        elif eleccion == "↩️ .. (Ir atrás)":
-            if ruta_actual.parent != ruta_actual:
-                ruta_actual = ruta_actual.parent
-        elif eleccion == "💽 [ Cambiar de Unidad de Disco ]":
-            unidades = [f"{d}:\\" for d in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' if os.path.exists(f"{d}:\\")]
-            if unidades:
-                unidad_elegida = seleccionar_opcion("Selecciona unidad de disco:", unidades)
-                ruta_actual = Path(unidad_elegida)
-            else:
-                limpiar_pantalla()
-                print(f"{Color.ROJO}No se detectaron otras unidades de disco.{Color.RESET}")
-                input("\nPresiona ENTER para continuar...")
-        else:
-            nombre_carpeta = eleccion.replace("📁 ", "")
-            ruta_actual = ruta_actual / nombre_carpeta
-
-# --- GESTIÓN DE COPIAS ---
-def gestionar_rotacion_backups(nombre_carpeta):
+def gestionar_rotacion_backups(nombre_carpeta, log_func=print):
     carpeta_historico = DIR_USB_BACKUPS / nombre_carpeta
     if not carpeta_historico.exists():
         return
 
     backups_existentes = sorted(
-        [d for d in carpeta_historico.iterdir() if d.name.startswith("backup_")],
+        [f for f in carpeta_historico.glob("backup_*.zip") if f.is_file()],
         key=lambda x: x.stat().st_mtime
     )
 
     while len(backups_existentes) >= MAX_BACKUPS:
         antiguo = backups_existentes.pop(0)
         try:
-            if antiguo.is_dir():
-                shutil.rmtree(antiguo)
-            else:
-                antiguo.unlink()
-            msg = f"Espacio optimizado: Se eliminó el resguardo automático más antiguo ({antiguo.name})"
-            print(f"{Color.ROJO}♻️ {msg}{Color.RESET}")
+            antiguo.unlink()
+            msg = f"♻️ Rotación: Eliminado backup antiguo ({antiguo.name})"
+            log_func(msg)
             logging.info(msg)
         except Exception as e:
-            print(f"{Color.AMARILLO}⚠️ No se pudo borrar el backup antiguo {antiguo.name}: {e}{Color.RESET}")
             logging.error(f"Fallo al eliminar backup antiguo {antiguo.name}: {e}")
 
-def ver_y_gestionar_copias():
-    while True:
-        def cabecera_proyectos():
-            print(f"┌────────────────────────────────────────────────────────────")
-            print(f"│ {Color.AZUL}🔍 ALMACENAMIENTO USB:{Color.RESET} {DIR_USB_BACKUPS}")
-            print(f"└────────────────────────────────────────────────────────────\n")
-        
-        if not DIR_USB_BACKUPS.exists() or not any(DIR_USB_BACKUPS.iterdir()):
-            limpiar_pantalla()
-            mostrar_logo()
-            print(f"{Color.ROJO}⚠️ No se encontraron proyectos o historiales en la unidad USB.{Color.RESET}")
-            input("\nPresiona ENTER para volver al menú...")
-            return
+def crear_backup_zip(origen, destino_zip, log_func=print):
+    try:
+        origen = Path(origen)
+        destino_zip = Path(destino_zip)
+        destino_zip.parent.mkdir(parents=True, exist_ok=True)
 
-        proyectos = [d.name for d in DIR_USB_BACKUPS.iterdir() if d.is_dir()]
-        opciones_proyectos = proyectos + ["🔙 <= Volver al menú principal"]
-        
-        proyecto_elegido = seleccionar_opcion(
-            "Selecciona un proyecto para examinar sus puntos de restauración:", 
-            opciones_proyectos, 
-            bloque_cabecera=proyectos
-        )
-        
-        if proyecto_elegido == "🔙 <= Volver al menú principal":
-            return
-            
-        carpeta_proyecto = DIR_USB_BACKUPS / proyecto_elegido
-        copias = sorted([d for d in carpeta_proyecto.iterdir() if d.name.startswith("backup_")], key=lambda x: x.stat().st_mtime, reverse=True)
-        
-        while True:
-            if not copias:
-                limpiar_pantalla()
-                mostrar_logo()
-                print("No existen copias de seguridad archivadas para este proyecto.")
-                input("\nPresiona ENTER para volver...")
-                break
+        with zipfile.ZipFile(destino_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            manifest_info = {
+                "fecha_creacion": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "creado_en_equipo": NOMBRE_EQUIPO,
+                "sistema_operativo": SISTEMA_OPERATIVO,
+                "origen_datos": str(origen)
+            }
+            zipf.writestr("manifest_backup.json", json.dumps(manifest_info, indent=4))
 
-            opciones_copias = []
-            for copia in copias:
-                tamano = obtener_tamano_formateado(copia)
-                try:
-                    fecha = datetime.fromtimestamp(copia.stat().st_mtime).strftime("%d/%m/%Y %H:%M")
-                except Exception:
-                    fecha = "Fecha desconocida"
-                icono = "📁" if copia.is_dir() else "📦"
-                etiqueta = f"{icono} {copia.name} | 📅 {fecha} | 💾 {tamano}"
-                opciones_copias.append(etiqueta)
-                
-            opciones_copias.append("🔙 <= Volver a la lista de proyectos")
-            
-            def cabecera_copias():
-                print(f"{Color.AZUL}📌 Proyecto seleccionado:{Color.RESET} {Color.BOLD}{proyecto_elegido}{Color.RESET}\n")
-
-            copia_elegida = seleccionar_opcion(
-                "Selecciona un archivo histórico para gestionar:", 
-                opciones_copias, 
-                bloque_cabecera=cabecera_copias
-            )
-            
-            if copia_elegida == "🔙 <= Volver a la lista de proyectos":
-                break
-                
-            nombre_real_copia = copia_elegida.split(" | ")[0].replace("📁 ", "").replace("📦 ", "")
-            ruta_copia_exacta = carpeta_proyecto / nombre_real_copia
-            
-            accion = seleccionar_opcion(f"¿Qué deseas hacer con '{nombre_real_copia}'?", [
-                "🗑️ Eliminar esta copia permanentemente",
-                "❌ <= Cancelar"
-            ])
-            
-            if accion.startswith("🗑️ Eliminar"):
-                confirmacion = seleccionar_opcion("❗ ¿Confirmas la eliminación permanente de este elemento histórico?", ["⚠️ Sí, borrar definitivamente", "❌ No, mantener a salvo"])
-                if "Sí, borrar" in confirmacion:
+            for root, dirs, files in os.walk(origen, followlinks=False):
+                dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+                for file in files:
+                    ruta_completa = Path(root) / file
+                    if ruta_completa.resolve() == destino_zip.resolve():
+                        continue
                     try:
-                        if ruta_copia_exacta.is_dir():
-                            shutil.rmtree(ruta_copia_exacta)
-                        else:
-                            ruta_copia_exacta.unlink()
-                        limpiar_pantalla()
-                        mostrar_logo()
-                        print(f"\n{Color.VERDE}✅ Elemento eliminado correctamente para liberar espacio en el USB.{Color.RESET}")
-                        logging.info(f"Usuario eliminó manualmente la copia: {ruta_copia_exacta.name}")
-                    except Exception as e:
-                        limpiar_pantalla()
-                        mostrar_logo()
-                        print(f"\n{Color.ROJO}❌ Error al procesar la baja del archivo: {e}{Color.RESET}")
-                        logging.error(f"Error al eliminar copia manual {ruta_copia_exacta.name}: {e}")
-                    input("\nPresiona ENTER para continuar...")
-                    copias = sorted([d for d in carpeta_proyecto.iterdir() if d.name.startswith("backup_")], key=lambda x: x.stat().st_mtime, reverse=True)
-                    if not copias:
-                        break
+                        arcname = ruta_completa.relative_to(origen)
+                        zipf.write(ruta_completa, arcname)
+                    except (PermissionError, FileNotFoundError) as fe:
+                        logging.warning(f"Omitido del ZIP por bloqueo: {ruta_completa} ({fe})")
 
-# --- COPIA INTELIGENTE ---
-def copiar_sincronizada(origen, destino, modo_espejo=False):
+        log_func(f"📦 Punto de restauración creado: {destino_zip.name}")
+        return True
+    except Exception as e:
+        logging.error(f"Error crítico creando ZIP {destino_zip}: {e}")
+        return False
+
+def ejecutar_copia_sincronizada(origen, destino, modo_espejo=False, callback_progreso=None, log_func=print):
     origen = Path(origen).resolve()
     destino = Path(destino).resolve()
     archivos_copiados = 0
     archivos_eliminados = 0
-    errores_encontrados = 0
-    
-    print(f"{Color.AMARILLO}🔍 Analizando estructuras de carpetas y calculando volúmenes...{Color.RESET}")
-    print(f"{Color.GRIS}   [Origen Absoluto: {origen}]{Color.RESET}")
-    print(f"{Color.GRIS}   [Destino Absoluto: {destino}]{Color.RESET}\n")
-    
-    try:
-        uso_destino = shutil.disk_usage(destino.anchor if destino.anchor else destino.parent)
-        if uso_destino.free < 50 * 1024 * 1024:
-            print(f"{Color.ROJO}⚠️ ¡ALERTA DE ESPACIO!: El espacio disponible en la unidad destino es sumamente limitado.{Color.RESET}")
-            input("Presiona ENTER si deseas continuar bajo tu responsabilidad...")
-    except Exception:
-        pass
+    errores = 0
+
+    log_func(f"\n🚀 EJECUTANDO SINCRONIZACIÓN:")
+    log_func(f" 📤 ORIGEN  : {origen}")
+    log_func(f" 📥 DESTINO : {destino}")
+
+    if not origen.exists():
+        log_func("❌ Error: La ruta origen no existe.")
+        return 0, 0
 
     todos_los_elementos = []
-    for root, dirs, files in os.walk(origen):
+    for root, dirs, files in os.walk(origen, followlinks=False):
         dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
         for file in files:
             todos_los_elementos.append(Path(root) / file)
-            
-    total_archivos = len(todos_los_elementos)
-    
-    if total_archivos == 0 and not modo_espejo:
-        print(f"{Color.AMARILLO}ℹ️ No se detectaron archivos nuevos o actualizados para transferir.{Color.RESET}")
-        return 0, 0
 
+    total_archivos = len(todos_los_elementos)
+
+    # Modo Espejo: Limpieza en destino
     if modo_espejo and destino.exists():
-        for root, dirs, files in os.walk(destino):
+        log_func("🧹 Aplicando eliminación espejo de elementos huérfanos...")
+        for root, dirs, files in os.walk(destino, followlinks=False):
             dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
             for file in files:
                 ruta_dest = Path(root) / file
@@ -388,263 +233,463 @@ def copiar_sincronizada(origen, destino, modo_espejo=False):
                 ruta_orig = origen / relativa
                 if not ruta_orig.exists():
                     try:
-                        print(f"{Color.ROJO}🗑️ Removiendo del destino (no existe en origen):{Color.RESET} {destino / relativa}")
                         ruta_dest.unlink()
                         archivos_eliminados += 1
+                        log_func(f" 🗑️ Eliminado de destino: {relativa}")
                     except Exception as e:
-                        logging.warning(f"No se pudo eliminar el archivo obsoleto {ruta_dest}: {e}")
+                        logging.warning(f"No se pudo eliminar {ruta_dest}: {e}")
 
-    porcentaje_anterior = -1
-    try:
-        for indice, item in enumerate(todos_los_elementos, 1):
-            relativa = item.relative_to(origen)
-            target = destino / relativa
-            
-            try:
-                if not target.exists() or item.stat().st_mtime > target.stat().st_mtime:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    print(f"{Color.CYAN}📄 Copiando:{Color.RESET} {item} {Color.CYAN}➔{Color.RESET} {target}")
+    # Copia / Actualización
+    for idx, item in enumerate(todos_los_elementos, 1):
+        relativa = item.relative_to(origen)
+        target = destino / relativa
+
+        try:
+            necesita_copia = False
+            if not target.exists():
+                necesita_copia = True
+            else:
+                stat_item = item.stat()
+                stat_target = target.stat()
+                if stat_item.st_size != stat_target.st_size or abs(stat_item.st_mtime - stat_target.st_mtime) > 2.0:
+                    necesita_copia = True
+
+            if necesita_copia:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
                     shutil.copy2(item, target)
-                    archivos_copiados += 1
-            except (PermissionError, FileNotFoundError, OSError) as ferr:
-                errores_encontrados += 1
-                logging.error(f"Error al copiar {item} -> {target}: {ferr}")
-                
-            porcentaje = int((indice / total_archivos) * 100) if total_archivos > 0 else 100
-            if porcentaje != porcentaje_anterior or indice == total_archivos:
-                porcentaje_anterior = porcentaje
-                bloques = int(porcentaje / 5)
-                barra = "█" * bloques + "░" * (20 - bloques)
-                sys.stdout.write(f"\r⚡ {Color.AZUL}Progreso:{Color.RESET} [{barra}] {porcentaje}% ({indice}/{total_archivos}) | {Color.VERDE}Copiados: {archivos_copiados}{Color.RESET} | {Color.ROJO}Borrados: {archivos_eliminados}{Color.RESET}")
-                sys.stdout.flush()
+                except (PermissionError, OSError):
+                    shutil.copy(item, target)
+                archivos_copiados += 1
+        except Exception as e:
+            errores += 1
+            logging.error(f"Error copiando {item}: {e}")
+
+        if callback_progreso:
+            callback_progreso(idx, total_archivos, archivos_copiados, archivos_eliminados)
+
+    msg_final = f"✅ Proceso finalizado. Copiados: {archivos_copiados} | Borrados Espejo: {archivos_eliminados} | Errores: {errores}"
+    log_func(msg_final)
+    logging.info(f"Sync ({origen} -> {destino}): {msg_final}")
+    return archivos_copiados, archivos_eliminados
+
+# --- INTERFAZ GRÁFICA (Tkinter THREAD-SAFE) ---
+if GUI_DISPONIBLE:
+    class Copy4MeGUI(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title(f"COPY FOR ME - Sincronizador Portátil ({VERSION})")
+            self.geometry("850x660")
+            self.minsize(750, 520)
+            self.config_data = cargar_configuracion()
+            self.ui_queue = queue.Queue()
             
-        print("\n")
-        if errores_encontrados > 0:
-            print(f"\n{Color.AMARILLO}⚠️ Transferencia completada. {errores_encontrados} elementos no críticos se omitieron (archivos bloqueados o en uso).{Color.RESET}")
-            print(f"📘 El informe de seguridad detallado está disponible en: '{Color.BOLD}copy4me_backups/sync_history.log{Color.RESET}'.")
-        
-        logging.info(f"Sincronización completada. Origen: {origen} | Destino: {destino} | Copiados: {archivos_copiados} | Borrados: {archivos_eliminados} | Errores: {errores_encontrados}")
-        return archivos_copiados, archivos_eliminados
+            self._crear_interfaz()
+            self.after(100, self._procesar_cola_ui)
 
-    except KeyboardInterrupt:
-        print(f"\n\n{Color.ROJO}🛑 Operación detenida inmediatamente a petición del usuario.{Color.RESET}")
-        return archivos_copiados, archivos_eliminados
-    except Exception as e:
-        print(f"\n\n{Color.ROJO}❌ Error inesperado durante el copiado seguro: {e}{Color.RESET}")
-        logging.critical(f"Excepción grave en copiar_sincronizada: {e}", exc_info=True)
-        return archivos_copiados, archivos_eliminados
+        def _procesar_cola_ui(self):
+            """Procesa mensajes provenientes de hilos secundarios de manera thread-safe."""
+            try:
+                while True:
+                    task, args = self.ui_queue.get_nowait()
+                    if task == "log":
+                        self._append_log(args[0])
+                    elif task == "progress":
+                        self._actualizar_progreso(args[0], args[1])
+                    elif task == "msgbox_info":
+                        messagebox.showinfo(args[0], args[1])
+                    elif task == "refresh":
+                        self._refresh_all()
+                    self.ui_queue.task_done()
+            except queue.Empty:
+                pass
+            finally:
+                self.after(100, self._procesar_cola_ui)
 
-# --- ACCIÓN 1: PC -> USB ---
-def subir_al_usb(solo_primera_vez=False):
-    limpiar_pantalla()
-    mostrar_logo()
-    
-    etiqueta_paso = "COPIA INICIAL" if solo_primera_vez else "RESPALDO / SINCRONIZACIÓN"
-    print(f"{Color.AZUL}[MODO: {etiqueta_paso}] Selección de datos de trabajo...{Color.RESET}\n")
-    
-    dir_origen = navegador_archivos("Selecciona la carpeta de tu PC que deseas asegurar:")
-    nombre_carpeta = dir_origen.name
-    
-    dir_master_usb = DIR_USB_BACKUPS / nombre_carpeta / "MASTER"
-    
-    # Resolver rutas absolutas completas para la transparencia visual
-    abs_origen = dir_origen.resolve()
-    abs_destino = dir_master_usb.resolve()
-    
-    modo_espejo = False
-    if not solo_primera_vez:
-        modo = seleccionar_opcion("¿Qué estrategia de resguardo prefieres aplicar en el USB?", [
-            "🔄 Estrategia Aditiva (Suma archivos nuevos, mantiene antiguos intactos en el USB)",
-            "🧹 Estrategia de Clonación Absoluta (Hace que el USB sea idéntico a tu PC, borrando lo que eliminaste)"
-        ])
-        modo_espejo = "Clonación Absoluta" in modo
-    else:
-        # En primera copia, si el destino ya tiene datos avisamos de forma estricta
-        if abs_destino.exists() and any(abs_destino.iterdir()):
-            limpiar_pantalla()
-            mostrar_logo()
-            print(f"{Color.AMARILLO}⚠️ ¡Atención! Has elegido 'Copiar por primera vez' pero el destino ya contiene archivos.{Color.RESET}")
-            print(f"Destino: {abs_destino}\n")
-            confirmar_sobrescribir = seleccionar_opcion("¿Deseas continuar y fusionar los datos en esta carpeta?", [
-                "✅ Sí, continuar de todos modos",
-                "❌ No, cancelar y volver al menú"
-            ])
-            if "No, cancelar" in confirmar_sobrescribir:
+        def log_gui(self, texto):
+            self.ui_queue.put(("log", (texto,)))
+
+        def _append_log(self, texto):
+            self.log_text.config(state='normal')
+            self.log_text.insert(tk.END, f"{texto}\n")
+            self.log_text.see(tk.END)
+            self.log_text.config(state='disabled')
+
+        def _actualizar_progreso(self, idx, total):
+            self.progress_bar['maximum'] = total if total > 0 else 1
+            self.progress_bar['value'] = idx
+
+        def _crear_interfaz(self):
+            header_frame = ttk.Frame(self, padding=10)
+            header_frame.pack(fill=tk.X)
+            lbl_banner = ttk.Label(header_frame, text="COPY ◄── 4 ──► ME", font=("Courier", 16, "bold"), foreground="#007acc")
+            lbl_banner.pack(side=tk.LEFT)
+            lbl_ver = ttk.Label(header_frame, text=f"{VERSION} | PC: {NOMBRE_EQUIPO}", font=("Helvetica", 9, "bold"))
+            lbl_ver.pack(side=tk.RIGHT)
+
+            self.notebook = ttk.Notebook(self)
+            self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+            # Pestañas
+            self.tab_subir = ttk.Frame(self.notebook, padding=10)
+            self.notebook.add(self.tab_subir, text=" 📤 PC ➔ USB (Respaldo) ")
+            self._build_tab_subir()
+
+            self.tab_descargar = ttk.Frame(self.notebook, padding=10)
+            self.notebook.add(self.tab_descargar, text=" 📥 USB ➔ PC (Restaurar) ")
+            self._build_tab_descargar()
+
+            self.tab_gestionar = ttk.Frame(self.notebook, padding=10)
+            self.notebook.add(self.tab_gestionar, text=" 🔍 Administrar Historias ")
+            self._build_tab_gestionar()
+
+            self.tab_perfiles = ttk.Frame(self.notebook, padding=10)
+            self.notebook.add(self.tab_perfiles, text=" ⚙️ Perfiles y Configuración ")
+            self._build_tab_perfiles()
+
+            # Consola de operaciones
+            console_frame = ttk.LabelFrame(self, text=" Registro de Operación en Vivo ", padding=10)
+            console_frame.pack(fill=tk.X, padx=10, pady=10)
+
+            self.progress_bar = ttk.Progressbar(console_frame, orient="horizontal", mode="determinate")
+            self.progress_bar.pack(fill=tk.X, pady=(0, 5))
+
+            self.log_text = tk.Text(console_frame, height=7, state='disabled', wrap='word', bg='#1e1e1e', fg='#00ffcc', font=("Consolas", 9))
+            self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        def _build_tab_subir(self):
+            ttk.Label(self.tab_subir, text="1. Selecciona un Perfil o explora la carpeta origen en tu PC:", font=('Helvetica', 9, 'bold')).pack(anchor=tk.W, pady=5)
+            f_opt = ttk.Frame(self.tab_subir)
+            f_opt.pack(fill=tk.X, pady=5)
+
+            perfiles = list(self.config_data.get("perfiles", {}).keys())
+            self.combo_perfiles = ttk.Combobox(f_opt, values=perfiles)
+            self.combo_perfiles.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+            self.combo_perfiles.bind("<<ComboboxSelected>>", self._on_perfil_selected)
+
+            btn_browse = ttk.Button(f_opt, text="Examinar PC...", command=self._browse_pc_folder)
+            btn_browse.pack(side=tk.RIGHT)
+
+            self.lbl_path = ttk.Label(self.tab_subir, text="Ruta local seleccionada: (Ninguna)", foreground="gray")
+            self.lbl_path.pack(anchor=tk.W, pady=5)
+
+            ttk.Separator(self.tab_subir, orient='horizontal').pack(fill='x', pady=10)
+
+            ttk.Label(self.tab_subir, text="2. Opciones de Sincronización hacia la USB:", font=('Helvetica', 9, 'bold')).pack(anchor=tk.W, pady=5)
+            self.var_espejo = tk.BooleanVar(value=False)
+            chk_espejo = ttk.Checkbutton(
+                self.tab_subir,
+                text="🧹 Modo Clonación Espejo (Elimina en el USB lo que hayas borrado en la PC)",
+                variable=self.var_espejo
+            )
+            chk_espejo.pack(anchor=tk.W, pady=5)
+
+            btn_start = ttk.Button(self.tab_subir, text="🚀 Guardar y Respaldar al USB", command=self._start_backup_thread)
+            btn_start.pack(anchor=tk.E, pady=15)
+
+        def _browse_pc_folder(self):
+            folder = filedialog.askdirectory(title="Selecciona la carpeta local a respaldar")
+            if folder:
+                p = Path(folder)
+                self.combo_perfiles.set(p.name)
+                self.lbl_path.config(text=f"Ruta local seleccionada: {p}")
+                if messagebox.askyesno("Guardar Perfil", f"¿Registrar el perfil '{p.name}' en config.json?"):
+                    self.config_data = registrar_o_actualizar_perfil(p.name, p)
+                    self.combo_perfiles['values'] = list(self.config_data.get("perfiles", {}).keys())
+
+        def _on_perfil_selected(self, event):
+            name = self.combo_perfiles.get()
+            pdata = self.config_data.get("perfiles", {}).get(name, {})
+            ruta = pdata.get("ruta_local") if isinstance(pdata, dict) else pdata
+            if ruta:
+                self.lbl_path.config(text=f"Ruta local seleccionada: {ruta}")
+
+        def _start_backup_thread(self):
+            nombre = self.combo_perfiles.get().strip()
+            pdata = self.config_data.get("perfiles", {}).get(nombre, {})
+            path_str = pdata.get("ruta_local") if isinstance(pdata, dict) else pdata
+
+            if not path_str:
+                path_str = self.lbl_path.cget("text").replace("Ruta local seleccionada: ", "")
+
+            if not nombre or not Path(path_str).exists():
+                messagebox.showerror("Error de Ruta", "Debes seleccionar una carpeta de origen válida en tu PC.")
                 return
 
-    # VENTANA DE CONFIRMACIÓN DE SEGURIDAD EXPLICATIVA CON RUTAS CLARAS ABSOLUTAS
-    limpiar_pantalla()
-    mostrar_logo()
-    print(f"{Color.AMARILLO}┌────────────────────────────────────────────────────────────")
-    print(f"│ 🛠️  RESUMEN DE SEGURIDAD ANTES DE OPERAR ({etiqueta_paso})")
-    print(f"├────────────────────────────────────────────────────────────")
-    print(f"│ 📤 ORIGEN (Tu PC):    {abs_origen}")
-    print(f"│ 📥 DESTINO (Tu USB):   {abs_destino}")
-    print(f"│ 📊 ESTRATEGIA:        {'Copia Inicial Directa' if solo_primera_vez else ('Clonación Espejo (Sincronización estricta)' if modo_espejo else 'Adición segura (Conservar históricos)')}")
-    print(f"│ 🛡️  HISTORIAL LOG:     Se registrarán las acciones en el USB")
-    print(f"└────────────────────────────────────────────────────────────{Color.RESET}\n")
-    
-    confirmar = seleccionar_opcion("¿Los datos de origen y destino son correctos para iniciar?", [
-        "✅ Sí, iniciar proceso seguro",
-        "❌ No, cancelar y volver al menú"
-    ])
-    if "No, cancelar" in confirmar:
-        return
+            origen = Path(path_str)
+            destino = DIR_USB_BACKUPS / nombre / "MASTER"
 
-    # Si no es primera copia y ya existe contenido, creamos el ZIP de punto de restauración
-    if not solo_primera_vez and abs_destino.exists() and any(abs_destino.iterdir()):
-        gestionar_rotacion_backups(nombre_carpeta)
-        fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_historico = DIR_USB_BACKUPS / nombre_carpeta / f"backup_{nombre_carpeta}_desdePC1_{fecha}.zip"
-        
-        print(f"\n{Color.AMARILLO}📦 Creando un Punto de Restauración (.ZIP) del estado anterior en tu USB...{Color.RESET}")
-        if crear_backup_zip(abs_destino, zip_historico):
-            print(f"{Color.VERDE}✅ Punto de restauración guardado: {zip_historico.name}{Color.RESET}")
-            logging.info(f"Backup histórico ZIP creado: {zip_historico.name}")
-        else:
-            print(f"{Color.AMARILLO}⚠️ No se pudo procesar la compresión previa. Avanzando de forma directa...{Color.RESET}")
+            msg = f"¿Iniciar respaldo de '{nombre}'?\n\n📤 Desde (PC): {origen}\n📥 Hacia (USB): {destino}"
+            if self.var_espejo.get():
+                msg += "\n\n⚠️ ATENCIÓN: El Modo Espejo eliminará en el USB los archivos borrados en la PC."
 
-    abs_destino.mkdir(parents=True, exist_ok=True)
-    copiados, borrados = copiar_sincronizada(abs_origen, abs_destino, modo_espejo)
-    
-    print(f"\n{Color.VERDE}┌────────────────────────────────────────────────────────────")
-    print(f"│ 🎉 ¡PROCESO COMPLETADO CON ÉXITO!                         ")
-    print(f"├────────────────────────────────────────────────────────────")
-    print(f"│ 📁 Ubicación final en USB: {abs_destino}")
-    print(f"│ 📥 Archivos agregados/actualizados: {copiados}")
-    if modo_espejo:
-        print(f"│ 🗑️ Archivos removidos del USB para igualar al PC: {borrados}")
-    print(f"└────────────────────────────────────────────────────────────{Color.RESET}")
-    input("\nPresiona ENTER para regresar al menú...")
+            if messagebox.askyesno("Confirmar Respaldo", msg):
+                registrar_o_actualizar_perfil(nombre, origen)
+                threading.Thread(target=self._worker_backup, args=(nombre, origen), daemon=True).start()
 
-# --- ACCIÓN 2: USB -> PC ---
-def descargar_del_usb():
-    limpiar_pantalla()
-    mostrar_logo()
-    print(f"{Color.AZUL}[PASO 1 DE 3] Selección de proyecto de la unidad externa...{Color.RESET}\n")
-    
-    if not DIR_USB_BACKUPS.exists():
-        print(f"{Color.ROJO}⚠️ El almacenamiento USB no contiene carpetas de backups válidas.{Color.RESET}")
-        input("\nPresiona ENTER para volver...")
-        return
+        def _worker_backup(self, nombre, origen):
+            destino = DIR_USB_BACKUPS / nombre / "MASTER"
 
-    proyectos = [d.name for d in DIR_USB_BACKUPS.iterdir() if d.is_dir()]
-    if not proyectos:
-        print(f"{Color.ROJO}⚠️ No se encontraron estructuras de proyectos válidas en el USB.{Color.RESET}")
-        input("\nPresiona ENTER para volver...")
-        return
+            if destino.exists() and any(destino.iterdir()):
+                gestionar_rotacion_backups(nombre, log_func=self.log_gui)
+                fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
+                crear_backup_zip(
+                    destino,
+                    DIR_USB_BACKUPS / nombre / f"backup_{nombre}_{NOMBRE_EQUIPO}_{fecha}.zip",
+                    log_func=self.log_gui
+                )
 
-    opciones_proyectos = proyectos + ["🔙 <= Volver al menú"]
-    proyecto_elegido = seleccionar_opcion("Selecciona el proyecto que deseas restaurar o actualizar en este PC:", opciones_proyectos)
-    
-    if proyecto_elegido == "🔙 <= Volver al menú":
-        return
+            destino.mkdir(parents=True, exist_ok=True)
 
-    dir_master_usb = DIR_USB_BACKUPS / proyecto_elegido / "MASTER"
-    
-    limpiar_pantalla()
-    mostrar_logo()
-    print(f"Determina la ruta de destino exacta para colocar '{proyecto_elegido}':\n")
-    dir_destino = navegador_archivos(f"Selecciona en qué directorio del PC colocarás '{proyecto_elegido}':")
+            def cb(idx, total, cop, borr):
+                self.ui_queue.put(("progress", (idx, total)))
 
-    if dir_destino.name != proyecto_elegido:
-        dir_destino = dir_destino / proyecto_elegido
+            ejecutar_copia_sincronizada(origen, destino, self.var_espejo.get(), callback_progreso=cb, log_func=self.log_gui)
+            self.ui_queue.put(("msgbox_info", ("Éxito", f"Respaldo de '{nombre}' completado correctamente.")))
+            self.ui_queue.put(("refresh", None))
 
-    # Resolver rutas absolutas para máxima claridad
-    abs_origen = dir_master_usb.resolve()
-    abs_destino = dir_destino.resolve()
+        def _build_tab_descargar(self):
+            ttk.Label(self.tab_descargar, text="1. Selecciona el proyecto guardado en el USB:", font=('Helvetica', 9, 'bold')).pack(anchor=tk.W, pady=5)
+            self.combo_usb = ttk.Combobox(self.tab_descargar)
+            self.combo_usb.pack(fill=tk.X, pady=5)
 
-    modo = seleccionar_opcion("¿Qué estrategia de restauración prefieres aplicar en este ordenador?", [
-        "🔄 Estrategia Aditiva (Descarga cambios sin alterar o borrar otros archivos del PC)",
-        "🧹 Estrategia de Clonación Absoluta (Fuerza al PC a ser idéntico al USB, borrando archivos locales sobrantes)"
-    ])
-    modo_espejo = "Clonación Absoluta" in modo
+            ttk.Separator(self.tab_descargar, orient='horizontal').pack(fill='x', pady=10)
 
-    # VENTANA DE CONFIRMACIÓN DE SEGURIDAD EXPLICATIVA CON RUTAS ABSOLUTAS CLARAS
-    limpiar_pantalla()
-    mostrar_logo()
-    print(f"{Color.AMARILLO}┌────────────────────────────────────────────────────────────")
-    print(f"│ 🛠️  RESUMEN DE SEGURIDAD ANTES DE OPERAR")
-    print(f"├────────────────────────────────────────────────────────────")
-    print(f"│ 📤 ORIGEN (Tu USB):   {abs_origen}")
-    print(f"│ 📥 DESTINO (Tu PC):   {abs_destino}")
-    print(f"│ 📊 ESTRATEGIA:        {'Clonación Espejo (Borrado local si no está en USB)' if modo_espejo else 'Adición segura (Respetar archivos del ordenador)'}")
-    print(f"│ 🛡️  PROTECCIÓN:        Si el destino tiene datos, se generará un .ZIP de salvaguarda")
-    print(f"└────────────────────────────────────────────────────────────{Color.RESET}\n")
+            ttk.Label(self.tab_descargar, text="2. Opciones de Sincronización hacia la PC local:", font=('Helvetica', 9, 'bold')).pack(anchor=tk.W, pady=5)
+            self.var_espejo_down = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                self.tab_descargar,
+                text="🧹 Modo Clonación Espejo en PC (Elimina en la PC elementos que ya no existen en el USB)",
+                variable=self.var_espejo_down
+            ).pack(anchor=tk.W, pady=5)
 
-    confirmar = seleccionar_opcion("¿Deseas dar luz verde al volcado de datos?", [
-        "✅ Sí, actualizar mi ordenador ahora",
-        "❌ No, abortar operación"
-    ])
-    if "No, abortar" in confirmar:
-        return
+            btn_down = ttk.Button(self.tab_descargar, text="📥 Descargar / Restaurar en PC", command=self._start_download_thread)
+            btn_down.pack(anchor=tk.E, pady=15)
 
-    destino_tiene_archivos = False
-    try:
-        if abs_destino.exists():
-            destino_tiene_archivos = any(abs_destino.iterdir())
-    except Exception:
-        pass
+        def _start_download_thread(self):
+            proj = self.combo_usb.get()
+            if not proj:
+                messagebox.showerror("Error", "Selecciona un proyecto del USB.")
+                return
 
-    if destino_tiene_archivos:
-        print(f"\n{Color.AMARILLO}⚠️ Alerta: El destino en el PC ya contiene datos. Archivando copia de seguridad preventiva en el USB...{Color.RESET}")
-        gestionar_rotacion_backups(proyecto_elegido)
-        fecha_pc = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        zip_respaldo_pc = DIR_USB_BACKUPS / proyecto_elegido / f"backup_{proyecto_elegido}_desdePC2_{fecha_pc}.zip"
-        if crear_backup_zip(abs_destino, zip_respaldo_pc):
-            print(f"{Color.VERDE}✅ Resguardo preventivo del PC archivado con éxito en el pendrive: {zip_respaldo_pc.name}{Color.RESET}")
-        else:
-            print(f"{Color.AMARILLO}⚠️ Error de empaquetado preventivo. Continuando bajo estricto control...{Color.RESET}")
+            pdata = self.config_data.get("perfiles", {}).get(proj, {})
+            saved_path = pdata.get("ruta_local") if isinstance(pdata, dict) else pdata
 
-    copiados, borrados = copiar_sincronizada(abs_origen, abs_destino, modo_espejo)
+            if saved_path and Path(saved_path).exists():
+                if messagebox.askyesno("Ruta Detectada", f"¿Restaurar en la ruta asignada a este equipo?\n{saved_path}"):
+                    dest = Path(saved_path)
+                else:
+                    dest = Path(filedialog.askdirectory(title="Selecciona destino en PC"))
+            else:
+                dest = Path(filedialog.askdirectory(title="Selecciona destino en PC"))
 
-    print(f"\n{Color.VERDE}┌────────────────────────────────────────────────────────────")
-    print(f"│ 🖥️  ¡SISTEMA LOCAL ACTUALIZADO CORRECTAMENTE!               ")
-    print(f"├────────────────────────────────────────────────────────────")
-    print(f"│ 📂 Destino en PC: {abs_destino}")
-    print(f"│ 📤 Archivos incorporados/actualizados: {copiados}")
-    if modo_espejo:
-        print(f"│ 🗑️ Archivos locales obsoletos eliminados de tu PC: {borrados}")
-    print(f"└────────────────────────────────────────────────────────────{Color.RESET}")
-    input("\nPresiona ENTER para regresar al menú...")
+            if not dest or str(dest) == ".":
+                return
 
-# --- BUCLE PRINCIPAL ---
-def main():
+            origen = DIR_USB_BACKUPS / proj / "MASTER"
+            msg = f"¿Iniciar restauración de '{proj}'?\n\n📤 Desde (USB): {origen}\n📥 Hacia (PC): {dest}"
+            if messagebox.askyesno("Confirmar Restauración", msg):
+                threading.Thread(target=self._worker_download, args=(proj, dest), daemon=True).start()
+
+        def _worker_download(self, proj, dest):
+            origen = DIR_USB_BACKUPS / proj / "MASTER"
+            if not origen.exists():
+                self.log_gui("❌ Error: No existe la carpeta MASTER en el USB.")
+                return
+
+            dest.mkdir(parents=True, exist_ok=True)
+
+            def cb(idx, total, cop, borr):
+                self.ui_queue.put(("progress", (idx, total)))
+
+            ejecutar_copia_sincronizada(origen, dest, self.var_espejo_down.get(), callback_progreso=cb, log_func=self.log_gui)
+            registrar_o_actualizar_perfil(proj, dest)
+            self.ui_queue.put(("msgbox_info", ("Éxito", f"Proyecto '{proj}' restaurado en PC.")))
+            self.ui_queue.put(("refresh", None))
+
+        def _build_tab_gestionar(self):
+            ttk.Label(self.tab_gestionar, text="Explorador de Puntos de Restauración (.ZIP) en el USB:").pack(anchor=tk.W, pady=5)
+            self.tree = ttk.Treeview(self.tab_gestionar, columns=("Fecha", "Tamaño"), show="tree headings")
+            self.tree.heading("#0", text="Proyecto / Archivos de Respaldo")
+            self.tree.heading("Fecha", text="Última Modificación")
+            self.tree.heading("Tamaño", text="Tamaño")
+            self.tree.pack(fill=tk.BOTH, expand=True, pady=5)
+
+            f_btns = ttk.Frame(self.tab_gestionar)
+            f_btns.pack(fill=tk.X, pady=5)
+
+            ttk.Button(f_btns, text="🗑️ Eliminar Backup Seleccionado", command=self._delete_selected_backup).pack(side=tk.LEFT)
+            ttk.Button(f_btns, text="🔄 Recargar Árbol", command=self._refresh_all).pack(side=tk.RIGHT)
+
+        def _delete_selected_backup(self):
+            selected = self.tree.selection()
+            if not selected:
+                return
+            item_text = self.tree.item(selected[0])['text']
+            parent_text = self.tree.item(self.tree.parent(selected[0]))['text']
+
+            if not parent_text:
+                messagebox.showwarning("Atención", "Selecciona un archivo .ZIP específico dentro de un proyecto.")
+                return
+
+            target = DIR_USB_BACKUPS / parent_text / item_text
+            if messagebox.askyesno("Confirmar Eliminación", f"¿Eliminar permanentemente el archivo {item_text}?"):
+                try:
+                    target.unlink()
+                    self.log_gui(f"🗑️ Copia eliminada: {item_text}")
+                    self._refresh_all()
+                except Exception as e:
+                    messagebox.showerror("Error", f"No se pudo eliminar: {e}")
+
+        def _build_tab_perfiles(self):
+            ttk.Label(self.tab_perfiles, text="Contenido Actualizado del Archivo de Perfiles (config.json):").pack(anchor=tk.W, pady=5)
+            self.txt_config = tk.Text(self.tab_perfiles, height=9, bg='#252526', fg='#ffffff', font=("Consolas", 9))
+            self.txt_config.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        def _refresh_all(self):
+            if DIR_USB_BACKUPS.exists():
+                projs = [d.name for d in DIR_USB_BACKUPS.iterdir() if d.is_dir()]
+                self.combo_usb['values'] = projs
+
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+
+            if DIR_USB_BACKUPS.exists():
+                for p in DIR_USB_BACKUPS.iterdir():
+                    if p.is_dir():
+                        node = self.tree.insert("", tk.END, text=p.name, open=True)
+                        for b in sorted(p.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+                            if b.name.startswith("backup_") or b.name == "MASTER":
+                                f_str = datetime.fromtimestamp(b.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                                size_str = obtener_tamano_formateado(b)
+                                self.tree.insert(node, tk.END, text=b.name, values=(f_str, size_str))
+
+            self.config_data = cargar_configuracion()
+            self.combo_perfiles['values'] = list(self.config_data.get("perfiles", {}).keys())
+            self.txt_config.delete("1.0", tk.END)
+            self.txt_config.insert(tk.END, json.dumps(self.config_data, indent=4, ensure_ascii=False))
+
+# --- MOTOR CONSOLA TUI COMPLETO (SOPORTE 100% MODO SIN PYTHON/GUI) ---
+def modo_tui_fallback():
     while True:
-        try:
-            menu_principal = [
-                "🆕 1. Copiar por PRIMERA VEZ al USB (Copia limpia PC -> USB)",
-                "🔄 2. Hacer RESPALDO / Sincronizar en USB (Con histórico preventivo PC -> USB)",
-                "📥 3. Descargar/Actualizar este PC (USB -> PC)",
-                "🔍 4. Ver y gestionar copias guardadas",
-                "❌ 5. Salir de la aplicación"
-            ]
-            
-            seleccion = seleccionar_opcion("¿Qué acción deseas ejecutar hoy?", menu_principal)
-            
-            if "1." in seleccion:
-                subir_al_usb(solo_primera_vez=True)
-            elif "2." in seleccion:
-                subir_al_usb(solo_primera_vez=False)
-            elif "3." in seleccion:
-                descargar_del_usb()
-            elif "4." in seleccion:
-                ver_y_gestionar_copias()
-            elif "5." in seleccion:
-                limpiar_pantalla()
-                print(f"\n{Color.VERDE}👍 El entorno se ha cerrado de manera íntegra. Ya puedes extraer tu dispositivo USB de forma segura. ¡Hasta pronto!{Color.RESET}")
-                logging.info("Sesión finalizada por el usuario.")
-                sys.exit(0)
-        except KeyboardInterrupt:
-            limpiar_pantalla()
-            print(f"\n\n{Color.VERDE}👋 Ejecución interrumpida limpiamente por comandos del sistema (Ctrl+C).{Color.RESET}")
-            sys.exit(0)
-        except Exception as e:
-            logging.critical(f"Error general inesperado en el bucle principal: {e}", exc_info=True)
-            limpiar_pantalla()
-            print(f"{Color.ROJO}⚠️ Se ha producido una anomalía inesperada en el hilo principal: {e}{Color.RESET}")
-            input("\nPresiona ENTER para reiniciar el entorno del menú...")
+        os.system('cls' if os.name == 'nt' else 'clear')
+        print(BANNER_ASCII)
+        print(f"\n{Color.AMARILLO}⚠️ AVISO: Entorno de Consola/TUI activado (Sin entorno gráfico Tkinter).{Color.RESET}")
+        print("\nMenú Principal:")
+        print(" 1. 📤 Respaldo PC ➔ USB")
+        print(" 2. 📥 Restaurar USB ➔ PC")
+        print(" 3. 🔍 Gestionar Historias (.ZIP)")
+        print(" 4. ⚙️ Ver Perfiles y Configuración")
+        print(" 5. ❌ Salir")
 
+        opt = input("\nSelecciona una opción [1-5]: ").strip()
+
+        if opt == "1":
+            config = cargar_configuracion()
+            perfiles = config.get("perfiles", {})
+            keys = list(perfiles.keys())
+            print("\n--- SELECCIONAR PERFIL O RUTA ---")
+            for idx, k in enumerate(keys, 1):
+                pdata = perfiles[k]
+                r_loc = pdata.get("ruta_local") if isinstance(pdata, dict) else pdata
+                print(f"  [{idx}] {k} -> {r_loc}")
+            print("  [0] Registrar nueva ruta...")
+
+            sel = input("\nOpción: ").strip()
+            if sel == "0" or not sel.isdigit() or int(sel) > len(keys):
+                path_str = input("Ruta local absoluta en la PC: ").strip()
+                p = Path(path_str)
+                if not p.exists():
+                    input("❌ Ruta no válida. Presiona ENTER para continuar..."); continue
+                nombre = p.name
+            else:
+                nombre = keys[int(sel)-1]
+                pdata = perfiles[nombre]
+                path_str = pdata.get("ruta_local") if isinstance(pdata, dict) else pdata
+
+            origen = Path(path_str)
+            destino = DIR_USB_BACKUPS / nombre / "MASTER"
+            modo_esp = input("¿Activar Modo Clonación Espejo? (s/N): ").strip().lower() == 's'
+
+            if input("\n¿Ejecutar respaldo? (s/N): ").strip().lower() == 's':
+                if destino.exists() and any(destino.iterdir()):
+                    gestionar_rotacion_backups(nombre)
+                    fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    crear_backup_zip(destino, DIR_USB_BACKUPS / nombre / f"backup_{nombre}_{NOMBRE_EQUIPO}_{fecha}.zip")
+
+                destino.mkdir(parents=True, exist_ok=True)
+                ejecutar_copia_sincronizada(origen, destino, modo_esp)
+                registrar_o_actualizar_perfil(nombre, origen)
+            input("\nPresiona ENTER para continuar...")
+
+        elif opt == "2":
+            print("\n--- RESTAURAR USB ➔ PC ---")
+            if not DIR_USB_BACKUPS.exists():
+                input("❌ No existen respaldos en la USB. Presiona ENTER..."); continue
+
+            proyectos = [d.name for d in DIR_USB_BACKUPS.iterdir() if d.is_dir()]
+            if not proyectos:
+                input("❌ No se encontraron proyectos respaldados. ENTER para continuar..."); continue
+
+            for idx, proj in enumerate(proyectos, 1):
+                print(f"  [{idx}] {proj}")
+
+            sel = input("\nSelecciona proyecto a restaurar: ").strip()
+            if not sel.isdigit() or int(sel) < 1 or int(sel) > len(proyectos):
+                continue
+
+            proj_nombre = proyectos[int(sel)-1]
+            origen = DIR_USB_BACKUPS / proj_nombre / "MASTER"
+
+            dest_str = input("Ruta destino absoluta en la PC (o ENTER para usar config.json): ").strip()
+            if not dest_str:
+                config = cargar_configuracion()
+                pdata = config.get("perfiles", {}).get(proj_nombre, {})
+                dest_str = pdata.get("ruta_local") if isinstance(pdata, dict) else pdata
+
+            if not dest_str:
+                input("❌ Ruta invalida. ENTER para continuar..."); continue
+
+            destino = Path(dest_str)
+            modo_esp = input("¿Activar Modo Espejo en PC? (s/N): ").strip().lower() == 's'
+
+            if input(f"\n¿Restaurar {proj_nombre} en {destino}? (s/N): ").strip().lower() == 's':
+                destino.mkdir(parents=True, exist_ok=True)
+                ejecutar_copia_sincronizada(origen, destino, modo_esp)
+                registrar_o_actualizar_perfil(proj_nombre, destino)
+            input("\nPresiona ENTER para continuar...")
+
+        elif opt == "3":
+            print("\n--- ADMINISTRAR HISTORIAS Y PUNTOS DE RESTAURACIÓN ---")
+            if DIR_USB_BACKUPS.exists():
+                for p in DIR_USB_BACKUPS.iterdir():
+                    if p.is_dir():
+                        print(f"\n📂 Proyecto: {p.name}")
+                        zips = sorted([b for b in p.iterdir() if b.name.startswith("backup_") or b.name == "MASTER"])
+                        for idx, b in enumerate(zips, 1):
+                            f_str = datetime.fromtimestamp(b.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                            print(f"   [{idx}] {b.name} | {f_str} | {obtener_tamano_formateado(b)}")
+            input("\nPresiona ENTER para continuar...")
+
+        elif opt == "4":
+            print("\n--- CONFIGURACIÓN Y PERFILES REGISTRADOS ---")
+            config = cargar_configuracion()
+            print(json.dumps(config, indent=4, ensure_ascii=False))
+            input("\nPresiona ENTER para continuar...")
+
+        elif opt == "5":
+            print("\n👋 ¡Saliendo de Copy4Me!")
+            sys.exit(0)
+
+# --- PUNTO DE ENTRADA GENERAL ---
 if __name__ == "__main__":
-    main()
+    if GUI_DISPONIBLE:
+        try:
+            app = Copy4MeGUI()
+            app._refresh_all()
+            app.mainloop()
+        except Exception as e:
+            logging.error(f"Fallo en GUI, conmutando a TUI: {e}")
+            modo_tui_fallback()
+    else:
+        modo_tui_fallback()
