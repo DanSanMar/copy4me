@@ -1,9 +1,9 @@
-Markdown
 
+# 📂 copy4me (ALL4ME)
 
-# 📂 Copy4Me (Enterprise)
+**Copy4Me** es una solución ligera, segura e intuitiva escrita en Python para la sincronización de archivos y gestión de copias de seguridad de proyectos locales hacia dispositivos de almacenamiento externo (USB, discos duros) o carpetas en red. Pensada para tener acualizados tus documentos entre multiples workstation de forma controlada y segura. 
 
-**Copy4Me** es una solución ligera, segura e intuitiva escrita en Python para la sincronización de archivos y gestión de copias de seguridad de proyectos locales hacia dispositivos de almacenamiento externo (USB, discos duros) o carpetas en red.
+**Estamos en fase de pruebas**, esperamos afianzar la aplicación antes de convertirla en ejecutable.
 
 ---
 
