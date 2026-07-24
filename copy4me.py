@@ -173,9 +173,10 @@ class ConfigManager:
     def get_perfil(self, nombre: str) -> Optional[Dict]:
         return self._data.get("perfiles", {}).get(nombre)
 
-    def set_perfil(self, nombre: str, ruta_local: Path, metadatos: Optional[Dict] = None):
+    def set_perfil(self, nombre: str, ruta_local: Path, ruta_destino: Optional[Path] = None, metadatos: Optional[Dict] = None):
         perfil = {
             "ruta_local": str(ruta_local.resolve()),
+            "ruta_destino": str(ruta_destino.resolve()) if ruta_destino else "",
             "ultimo_equipo": socket.gethostname(),
             "sistema_operativo": f"{platform.system()} {platform.release()}",
             "ultima_sincronizacion": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -861,7 +862,14 @@ if GUI_AVAILABLE:
             perfil = self.config.get_perfil(nombre)
             if perfil:
                 self.lbl_ruta_origen.config(text=f"Ruta seleccionada: {perfil.get('ruta_local', '')}")
-                self._actualizar_sugerencia_destino(nombre)
+                
+                # Si el perfil ya tiene una ruta de destino guardada, la cargamos
+                ruta_destino_guardada = perfil.get("ruta_destino", "")
+                if ruta_destino_guardada:
+                    self.entry_destino_respaldo.delete(0, tk.END)
+                    self.entry_destino_respaldo.insert(0, ruta_destino_guardada)
+                else:
+                    self._actualizar_sugerencia_destino(nombre)
 
         def _browse_origen(self):
             folder = filedialog.askdirectory(title="Selecciona la carpeta raíz a respaldar")
@@ -946,7 +954,14 @@ if GUI_AVAILABLE:
                 callback_log=self.log_gui
             )
 
-            self.config.set_perfil(nombre, origen, {"ultima_sincronizacion": datetime.now().isoformat()})
+            # AHORA INCLUIMOS 'destino' AL ACTUALIZAR EL PERFIL
+            self.config.set_perfil(
+                nombre, 
+                origen, 
+                ruta_destino=destino, 
+                metadatos={"ultima_sincronizacion": datetime.now().isoformat()}
+            )
+            
             self.ui_queue.put(("msgbox", ("Respaldo Finalizado", f"Operación completada exitosamente.\n\nArchivos copiados: {copiados}\nEliminados: {eliminados}\nErrores: {errores}")))
             self.ui_queue.put(("refresh", None))
 
@@ -1173,7 +1188,12 @@ def modo_tui():
             if input(f"¿Confirmar respaldo del proyecto '{nombre}' en '{destino}'? (s/N): ").strip().lower() == 's':
                 if destino.exists() and any(destino.iterdir()) and modo == "espejo":
                     engine.crear_backup_zip(destino, nombre, password, config.get_opcion("compresion", 6), log_tui)
+                
                 engine.sincronizar(origen, destino, modo, callback_log=log_tui)
+                
+                # Guardar el perfil incluyendo la ruta de destino
+                config.set_perfil(nombre, origen, ruta_destino=destino)
+                
             input("\nPresione ENTER para continuar...")
 
         elif opcion == "2":
