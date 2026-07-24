@@ -75,7 +75,7 @@ BANNER = f"""{Color.CYAN} ██████╗ ██████╗ ███�
 {Color.VERDE}██║     ██║   ██║██████╔╝██║███████║██╔████╔██║█████╗  
 ██║     ██║   ██║██╔═══╝ ╚═╝╚════██║██║╚██╔╝██║██╔══╝  
 {Color.MAGENTA}╚██████╗╚██████╔╝██║        ██║  ██║██║ ╚═╝ ██║███████╗
- ╚═════╝ ╚═════╝ ╚═╝        ╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝{Color.RESET}"""
+ ╚═════╝ ╚═════╝ ╚═╝        ╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝{Color.RESET}
  
 {Color.CYAN}               _________________________________________
     [ PC-1 ]       C  O  P  Y  ◄─── 4 ──►  M  E         [ PC-2 ]
@@ -267,20 +267,25 @@ class SecurityUtils:
             iv = os.urandom(16)
             cipher = AES.new(key, AES.MODE_CBC, iv)
 
-            file_size = origen.stat().st_size
-            bytes_read = 0
-
             with open(origen, 'rb') as f_in, open(destino, 'wb') as f_out:
                 f_out.write(salt)
                 f_out.write(iv)
                 while True:
                     chunk = f_in.read(CHUNK_SIZE)
-                    bytes_read += len(chunk)
-                    if bytes_read == file_size: # Último bloque
+                    if len(chunk) == 0:
+                        break
+                    elif len(chunk) % AES.block_size != 0:
                         f_out.write(cipher.encrypt(pad(chunk, AES.block_size)))
                         break
                     else:
-                        f_out.write(cipher.encrypt(chunk))
+                        if len(chunk) < CHUNK_SIZE:
+                            f_out.write(cipher.encrypt(pad(chunk, AES.block_size)))
+                            break
+                        else:
+                            f_out.write(cipher.encrypt(chunk))
+                # Si el archivo era multiplo exacto de CHUNK_SIZE, se añade padding al final
+                else:
+                    f_out.write(cipher.encrypt(pad(b"", AES.block_size)))
             return True
         except Exception as e:
             logger.error(f"Error al cifrar archivo {origen}: {e}")
@@ -290,7 +295,7 @@ class SecurityUtils:
 
     @staticmethod
     def descifrar_archivo(origen: Path, destino: Path, password: str) -> bool:
-        """Descifra un archivo por bloques."""
+        """Descifra un archivo por bloques de manera segura."""
         if not CRYPTO_AVAILABLE:
             raise RuntimeError("La librería PyCryptodome no está instalada.")
         try:
@@ -304,19 +309,19 @@ class SecurityUtils:
                 key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
                 cipher = AES.new(key, AES.MODE_CBC, iv)
 
-                total_encrypted = file_size - 32
-                bytes_processed = 0
-
                 with open(destino, 'wb') as f_out:
+                    buffer = b""
                     while True:
                         chunk = f_in.read(CHUNK_SIZE)
                         if not chunk:
+                            if buffer:
+                                f_out.write(unpad(cipher.decrypt(buffer), AES.block_size))
                             break
-                        bytes_processed += len(chunk)
-                        decrypted_chunk = cipher.decrypt(chunk)
-                        if bytes_processed == total_encrypted:
-                            decrypted_chunk = unpad(decrypted_chunk, AES.block_size)
-                        f_out.write(decrypted_chunk)
+                        buffer += chunk
+                        if len(buffer) > AES.block_size * 2:
+                            to_decrypt = buffer[:-AES.block_size * 2]
+                            buffer = buffer[-AES.block_size * 2:]
+                            f_out.write(cipher.decrypt(to_decrypt))
             return True
         except Exception as e:
             logger.error(f"Error al descifrar archivo {origen}: {e}")
@@ -386,7 +391,6 @@ class SyncEngine:
 
         archivos_origen = []
         for root, dirs, files in os.walk(origen):
-            # Exclusión de directorios en el propio bucle de caminata
             dirs[:] = [d for d in dirs if not self._excluir_archivo(Path(root) / d)]
             for f in files:
                 r = Path(root) / f
@@ -525,7 +529,6 @@ class SyncEngine:
                 if callback_log: callback_log("❌ Error: PyCryptodome no está instalado.")
                 return False
             try:
-                # Creación segura de archivo temporal
                 temp_zip_file = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
                 temp_zip_path = Path(temp_zip_file.name)
                 temp_zip_file.close()
@@ -547,11 +550,9 @@ class SyncEngine:
                 for member in zf.infolist():
                     if member.filename == "manifest_backup.json":
                         continue
-                    # Protección Zip Slip
-                    target_path = (destino_dir / member.filename).resolve()
-                    try:
-                        target_path.relative_to(destino_dir)
-                    except ValueError:
+                    # Protección Zip Slip estricta
+                    target_path = Path(os.path.abspath(os.path.join(destino_dir, member.filename)))
+                    if not str(target_path).startswith(str(destino_dir)):
                         if callback_log: callback_log(f"⚠️ Omitido archivo potencialmente peligroso: {member.filename}")
                         continue
                     zf.extract(member, destino_dir)
@@ -707,7 +708,7 @@ if GUI_AVAILABLE:
             self.lbl_ruta_origen = ttk.Label(card_origen, text="Ruta seleccionada: (Ninguna)", font=self.font_sub)
             self.lbl_ruta_origen.pack(anchor=tk.W, pady=(5, 0))
 
-            # 2. Destino (¡NUEVO!)
+            # 2. Destino
             card_destino = ttk.LabelFrame(self.tab_respaldo, text=" 2. Carpeta de Destino (USB / Dispositivo / Carpeta Personalizada) ", padding=10)
             card_destino.pack(fill=tk.X, pady=5)
 
@@ -897,7 +898,6 @@ if GUI_AVAILABLE:
                 messagebox.showerror("Error de Ruta", f"La carpeta local no existe:\n{origen}")
                 return
 
-            # Obtener el destino seleccionado por el usuario o usar la detección por defecto
             destino_str = self.entry_destino_respaldo.get().strip()
             if destino_str:
                 destino = Path(destino_str)
@@ -925,7 +925,6 @@ if GUI_AVAILABLE:
             if not messagebox.askyesno("Confirmación de Operación", msg):
                 return
 
-            # Se pasan todos los parámetros explícitamente para desacoplar el hilo secundario de la GUI
             threading.Thread(
                 target=self._worker_respaldo,
                 args=(nombre, origen, destino, modo, password, compression_level),
@@ -1143,8 +1142,6 @@ def modo_tui():
                 config.set_perfil(nombre, Path(ruta))
 
             origen = Path(ruta)
-            
-            # Sugerencia y elección de destino en TUI
             destino_usb = USBDetector.buscar_proyecto_en_usb(nombre)
             destino_default = destino_usb if destino_usb else (DIR_BACKUPS / nombre / "MASTER")
             

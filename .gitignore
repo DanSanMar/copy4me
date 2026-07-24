@@ -1,0 +1,62 @@
+
+# ===============================
+# Configuración y Respaldos Locales (Copy4Me)
+# ===============================
+config.json
+copy4me_backups/
+*.zip
+*.zip.enc
+*.log
+
+# ===============================
+# Entornos Virtuales
+# ===============================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ===============================
+# Archivos de Caché y Ejecución Python
+# ===============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ===============================
+# Compilación de Ejecutables (PyInstaller / cx_Freeze)
+# ===============================
+build/
+dist/
+*.manifest
+*.spec
+
+# ===============================
+# Archivos de Entornos de Desarrollo (IDEs)
+# ===============================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===============================
+# Archivos Basura del Sistema Operativo
+# ===============================
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+.Trash-*
