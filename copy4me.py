@@ -213,7 +213,6 @@ class USBDetector:
                     if bitmask & (1 << i):
                         letter = chr(65 + i) + ":\\"
                         drive_type = ctypes.windll.kernel32.GetDriveTypeW(letter)
-                        # DRIVE_REMOVABLE (2) o DRIVE_FIXED (3) si no es la unidad C:
                         if drive_type == 2 or (drive_type == 3 and not letter.startswith("C")):
                             unidades.append(Path(letter))
             except Exception as e:
@@ -259,7 +258,6 @@ class SecurityUtils:
 
     @staticmethod
     def cifrar_archivo(origen: Path, destino: Path, password: str) -> bool:
-        """Cifra un archivo de forma eficiente por bloques (evita saturación de RAM)."""
         if not CRYPTO_AVAILABLE:
             raise RuntimeError("La librería PyCryptodome no está instalada.")
         try:
@@ -284,7 +282,6 @@ class SecurityUtils:
                             break
                         else:
                             f_out.write(cipher.encrypt(chunk))
-                # Si el archivo era multiplo exacto de CHUNK_SIZE, se añade padding al final
                 else:
                     f_out.write(cipher.encrypt(pad(b"", AES.block_size)))
             return True
@@ -296,7 +293,6 @@ class SecurityUtils:
 
     @staticmethod
     def descifrar_archivo(origen: Path, destino: Path, password: str) -> bool:
-        """Descifra un archivo por bloques de manera segura."""
         if not CRYPTO_AVAILABLE:
             raise RuntimeError("La librería PyCryptodome no está instalada.")
         try:
@@ -355,12 +351,10 @@ class SyncEngine:
         return False
 
     def _copiar_con_reintentos(self, src: Path, dst: Path, max_attempts=3) -> bool:
-        """Copia un archivo individual con tolerancia a fallos y soporte para sistemas FAT32."""
         for attempt in range(max_attempts):
             try:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 if dst.exists():
-                    # Tolerancia de 2.0 segundos para diferencias de precisión FAT32
                     if src.stat().st_size == dst.stat().st_size and abs(src.stat().st_mtime - dst.stat().st_mtime) <= 2.0:
                         return True
                 shutil.copy2(src, dst)
@@ -401,7 +395,6 @@ class SyncEngine:
         total = len(archivos_origen)
         copiados, eliminados, errores = 0, 0, 0
 
-        # Copia Origen -> Destino
         for idx, src in enumerate(archivos_origen, 1):
             rel = src.relative_to(origen)
             dst = destino / rel
@@ -412,7 +405,6 @@ class SyncEngine:
             else:
                 errores += 1
 
-        # Limpieza de Huérfanos en Modo Espejo / Bidireccional
         if modo in ("espejo", "bidireccional") and destino.exists():
             for root, _, files in os.walk(destino):
                 for f in files:
@@ -442,6 +434,64 @@ class SyncEngine:
             callback_log(f"✅ Sincronización finalizada. Copiados: {copiados}, Eliminados: {eliminados}, Errores: {errores}")
         return copiados, eliminados, errores
 
+    def _rotar_backups(self, carpeta: Path, password: Optional[str] = None, callback_log: Optional[Callable] = None) -> bool:
+        """
+        Rota los backups inteligentemente. Elimina huérfanos.
+        Retorna True si se alcanzó el límite y se debe forzar un Backup Base (Completo).
+        """
+        backups = sorted(
+            [f for f in carpeta.glob("backup_*.zip*") if f.is_file()],
+            key=lambda x: x.stat().st_mtime
+        )
+        if len(backups) < self.max_backups:
+            return False
+            
+        ultimo_zip = backups[-1]
+        zips_activos = {ultimo_zip.name}
+        temp_zip_path = None
+        
+        try:
+            target_zip = ultimo_zip
+            if ultimo_zip.suffix == ".enc" and password and CRYPTO_AVAILABLE:
+                temp_zip_file = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+                temp_zip_path = Path(temp_zip_file.name)
+                temp_zip_file.close()
+                if SecurityUtils.descifrar_archivo(ultimo_zip, temp_zip_path, password):
+                    target_zip = temp_zip_path
+            
+            with zipfile.ZipFile(target_zip, 'r') as zf:
+                if "manifest_backup.json" in zf.namelist():
+                    data = json.loads(zf.read("manifest_backup.json"))
+                    archivos = data.get("archivos", {})
+                    if isinstance(archivos, dict):
+                        for meta in archivos.values():
+                            if "ubicacion_zip" in meta:
+                                zips_activos.add(meta["ubicacion_zip"])
+                    elif isinstance(archivos, list):
+                        zips_activos.add(ultimo_zip.name)
+        except Exception as e:
+            logger.warning(f"Error leyendo dependencias para rotación: {e}")
+        finally:
+            if temp_zip_path and temp_zip_path.exists():
+                temp_zip_path.unlink()
+
+        # Eliminar backups que no pertenecen a la cadena activa
+        for antiguo in backups[:-1]:
+            if antiguo.name not in zips_activos:
+                try:
+                    antiguo.unlink()
+                    if callback_log: callback_log(f"♻️ Rotación: Eliminado backup huérfano {antiguo.name}")
+                except Exception as e:
+                    logger.warning(f"No se pudo eliminar backup antiguo {antiguo}: {e}")
+                    
+        # Si aún excedemos el límite de archivos, forzamos un backup completo
+        backups_restantes = [f for f in carpeta.glob("backup_*.zip*") if f.is_file()]
+        if len(backups_restantes) >= self.max_backups:
+            if callback_log: callback_log("♻️ Límite de retención alcanzado. Forzando Backup Base (Completo) para reiniciar la cadena.")
+            return True
+            
+        return False
+
     def crear_backup_zip(self, carpeta_origen: Path, nombre_proyecto: str,
                          password: Optional[str] = None,
                          compression_level: int = DEFAULT_COMPRESSION_LEVEL,
@@ -452,37 +502,91 @@ class SyncEngine:
 
         carpeta_backups = DIR_BACKUPS / nombre_proyecto
         carpeta_backups.mkdir(parents=True, exist_ok=True)
-        self._rotar_backups(carpeta_backups, callback_log)
+        
+        # Ejecutar rotación y determinar si debemos forzar backup completo
+        forzar_completo = self._rotar_backups(carpeta_backups, password, callback_log)
 
         fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
         nombre_zip = f"backup_{nombre_proyecto}_{socket.gethostname()}_{fecha}.zip"
         ruta_zip = carpeta_backups / nombre_zip
 
         if callback_log:
-            callback_log(f"📦 Generando paquete de respaldo: {ruta_zip.name}")
+            callback_log(f"📦 Generando paquete de respaldo incremental: {ruta_zip.name}")
 
         try:
+            manifiesto_anterior = {}
+            if not forzar_completo:
+                backups_existentes = sorted(
+                    [f for f in carpeta_backups.glob("backup_*.zip*") if f.is_file()],
+                    key=lambda x: x.stat().st_mtime, reverse=True
+                )
+                
+                if backups_existentes:
+                    ultimo_zip = backups_existentes[0]
+                    temp_zip_path = None
+                    target_zip = ultimo_zip
+                    
+                    if ultimo_zip.suffix == ".enc" and password and CRYPTO_AVAILABLE:
+                        temp_zip_file = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+                        temp_zip_path = Path(temp_zip_file.name)
+                        temp_zip_file.close()
+                        if SecurityUtils.descifrar_archivo(ultimo_zip, temp_zip_path, password):
+                            target_zip = temp_zip_path
+                    
+                    try:
+                        with zipfile.ZipFile(target_zip, 'r') as zf_old:
+                            if "manifest_backup.json" in zf_old.namelist():
+                                data = json.loads(zf_old.read("manifest_backup.json"))
+                                if isinstance(data.get("archivos"), list):
+                                    for arch in data["archivos"]:
+                                        arch["ubicacion_zip"] = arch.get("ubicacion_zip", ultimo_zip.name)
+                                        manifiesto_anterior[arch["ruta"]] = arch
+                                elif isinstance(data.get("archivos"), dict):
+                                    manifiesto_anterior = data["archivos"]
+                    except Exception as e:
+                        logger.warning(f"No se pudo leer el manifiesto anterior: {e}")
+                    finally:
+                        if temp_zip_path and temp_zip_path.exists():
+                            temp_zip_path.unlink()
+
             with zipfile.ZipFile(ruta_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=compression_level) as zf:
                 manifest = {
                     "version": VERSION,
                     "fecha_creacion": datetime.now().isoformat(),
                     "equipo": socket.gethostname(),
                     "origen": str(carpeta_origen),
-                    "archivos": []
+                    "archivos": {}
                 }
+                
                 for root, dirs, files in os.walk(carpeta_origen):
                     dirs[:] = [d for d in dirs if not self._excluir_archivo(Path(root) / d)]
                     for f in files:
                         ruta_archivo = Path(root) / f
                         if self._excluir_archivo(ruta_archivo):
                             continue
-                        arcname = ruta_archivo.relative_to(carpeta_origen)
-                        zf.write(ruta_archivo, arcname)
-                        if self.config.get_opcion("verificar_hash", True):
-                            manifest["archivos"].append({
-                                "ruta": str(arcname),
-                                "hash": SecurityUtils.calcular_hash(ruta_archivo)
-                            })
+                            
+                        arcname = str(ruta_archivo.relative_to(carpeta_origen))
+                        stat = ruta_archivo.stat()
+                        st_size = stat.st_size
+                        st_mtime = stat.st_mtime
+                        
+                        archivo_previo = manifiesto_anterior.get(arcname)
+                        
+                        if (not archivo_previo or 
+                            archivo_previo.get("st_size") != st_size or 
+                            abs(archivo_previo.get("st_mtime", 0) - st_mtime) > 2.0):
+                            
+                            zf.write(ruta_archivo, arcname)
+                            manifest["archivos"][arcname] = {
+                                "ruta": arcname,
+                                "st_size": st_size,
+                                "st_mtime": st_mtime,
+                                "ubicacion_zip": nombre_zip,
+                                "hash": SecurityUtils.calcular_hash(ruta_archivo) if self.config.get_opcion("verificar_hash", True) else ""
+                            }
+                        else:
+                            manifest["archivos"][arcname] = archivo_previo
+
                 zf.writestr("manifest_backup.json", json.dumps(manifest, indent=4))
 
             if password and CRYPTO_AVAILABLE:
@@ -502,20 +606,6 @@ class SyncEngine:
             logger.error(f"Error creando backup zip: {e}")
             if callback_log: callback_log(f"❌ Error al crear backup: {e}")
             return None
-
-    def _rotar_backups(self, carpeta: Path, callback_log: Optional[Callable] = None):
-        backups = sorted(
-            [f for f in carpeta.glob("backup_*.zip*") if f.is_file()],
-            key=lambda x: x.stat().st_mtime
-        )
-        while len(backups) >= self.max_backups:
-            antiguo = backups.pop(0)
-            try:
-                antiguo.unlink()
-                if callback_log:
-                    callback_log(f"♻️ Rotación de historial: Eliminado backup antiguo {antiguo.name}")
-            except Exception as e:
-                logger.warning(f"No se pudo eliminar backup antiguo {antiguo}: {e}")
 
     def restaurar_desde_backup(self, ruta_zip: Path, destino: Path, password: Optional[str] = None,
                                callback_log: Optional[Callable] = None) -> bool:
@@ -548,15 +638,54 @@ class SyncEngine:
             destino_dir.mkdir(parents=True, exist_ok=True)
 
             with zipfile.ZipFile(target_zip, 'r') as zf:
-                for member in zf.infolist():
-                    if member.filename == "manifest_backup.json":
+                manifest_data = json.loads(zf.read("manifest_backup.json"))
+            
+            diccionario_archivos = manifest_data.get("archivos", {})
+            if isinstance(diccionario_archivos, list):
+                diccionario_archivos = {a["ruta"]: {"ubicacion_zip": target_zip.name} for a in diccionario_archivos}
+
+            zips_necesarios = {}
+            for arcname, meta in diccionario_archivos.items():
+                zip_origen = meta.get("ubicacion_zip", target_zip.name)
+                # Fallback para archivos sin extensión .enc registrados en el manifiesto
+                if zip_origen.endswith(".zip") and not (ruta_zip.parent / zip_origen).exists():
+                    if (ruta_zip.parent / f"{zip_origen}.enc").exists():
+                        zip_origen = f"{zip_origen}.enc"
+                
+                if zip_origen not in zips_necesarios:
+                    zips_necesarios[zip_origen] = []
+                zips_necesarios[zip_origen].append(arcname)
+                
+            for nombre_zip_hist, archivos_a_extraer in zips_necesarios.items():
+                ruta_zip_hist = ruta_zip.parent / nombre_zip_hist
+                if not ruta_zip_hist.exists():
+                    logger.error(f"Falta archivo requerido de la cadena de backups: {nombre_zip_hist}")
+                    if callback_log: callback_log(f"⚠️ Falta archivo histórico: {nombre_zip_hist}")
+                    continue
+
+                temp_hist_path = None
+                target_hist_zip = ruta_zip_hist
+                
+                if ruta_zip_hist.suffix == ".enc":
+                    temp_hist_file = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+                    temp_hist_path = Path(temp_hist_file.name)
+                    temp_hist_file.close()
+                    if not SecurityUtils.descifrar_archivo(ruta_zip_hist, temp_hist_path, password):
+                        logger.error(f"Error descifrando {nombre_zip_hist}")
                         continue
-                    # Protección Zip Slip estricta
-                    target_path = Path(os.path.abspath(os.path.join(destino_dir, member.filename)))
-                    if not str(target_path).startswith(str(destino_dir)):
-                        if callback_log: callback_log(f"⚠️ Omitido archivo potencialmente peligroso: {member.filename}")
-                        continue
-                    zf.extract(member, destino_dir)
+                    target_hist_zip = temp_hist_path
+
+                try:
+                    with zipfile.ZipFile(target_hist_zip, 'r') as zf:
+                        for member in zf.infolist():
+                            if member.filename in archivos_a_extraer:
+                                target_path = Path(destino_dir) / member.filename
+                                # Prevención de vulnerabilidad Zip Slip
+                                if target_path.resolve().is_relative_to(destino_dir.resolve()):
+                                    zf.extract(member, destino_dir)
+                finally:
+                    if temp_hist_path and temp_hist_path.exists():
+                        temp_hist_path.unlink()
 
             if callback_log:
                 callback_log("✅ Restauración completada con éxito.")
@@ -612,6 +741,16 @@ if GUI_AVAILABLE:
                         self._append_log(args[0])
                     elif task == "progress":
                         self._actualizar_progreso(*args)
+                    elif task == "set_determinate":
+                        self.progress_bar.stop()
+                        self.progress_bar.config(mode="determinate", maximum=args[0] if args[0] > 0 else 1)
+                    elif task == "status_text":
+                        self.lbl_archivo_actual.config(text=args[0])
+                    elif task == "stop_progress":
+                        self.progress_bar.stop()
+                        self.progress_bar['value'] = 0
+                        self.lbl_progreso.config(text="Estado: En espera")
+                        self.lbl_archivo_actual.config(text="")
                     elif task == "msgbox":
                         messagebox.showinfo(args[0], args[1])
                     elif task == "msgbox_error":
@@ -693,7 +832,6 @@ if GUI_AVAILABLE:
             self.log_text.pack(fill=tk.BOTH, expand=True)
 
         def _build_tab_respaldo(self):
-            # 1. Origen
             card_origen = ttk.LabelFrame(self.tab_respaldo, text=" 1. Proyecto / Carpeta a respaldar ", padding=10)
             card_origen.pack(fill=tk.X, pady=5)
 
@@ -709,7 +847,6 @@ if GUI_AVAILABLE:
             self.lbl_ruta_origen = ttk.Label(card_origen, text="Ruta seleccionada: (Ninguna)", font=self.font_sub)
             self.lbl_ruta_origen.pack(anchor=tk.W, pady=(5, 0))
 
-            # 2. Destino
             card_destino = ttk.LabelFrame(self.tab_respaldo, text=" 2. Carpeta de Destino (USB / Dispositivo / Carpeta Personalizada) ", padding=10)
             card_destino.pack(fill=tk.X, pady=5)
 
@@ -721,7 +858,6 @@ if GUI_AVAILABLE:
 
             ttk.Label(card_destino, text="   (Si se deja en blanco, se detectará automáticamente un USB o la carpeta por defecto del sistema)", font=self.font_sub).pack(anchor=tk.W, pady=(5, 0))
 
-            # 3. Modalidad
             card_modos = ttk.LabelFrame(self.tab_respaldo, text=" 3. Selecciona la Modalidad de Sincronización ", padding=10)
             card_modos.pack(fill=tk.X, pady=10)
 
@@ -739,7 +875,6 @@ if GUI_AVAILABLE:
             r3.pack(anchor=tk.W)
             ttk.Label(card_modos, text="   Combina los cambios de ambos lados. Si creaste un archivo en la USB, se copiará de vuelta al PC.", font=self.font_sub).pack(anchor=tk.W, pady=(0, 5))
 
-            # 4. Seguridad
             card_seg = ttk.LabelFrame(self.tab_respaldo, text=" 4. Seguridad y Protección ", padding=10)
             card_seg.pack(fill=tk.X, pady=5)
 
@@ -851,7 +986,6 @@ if GUI_AVAILABLE:
             ttk.Button(self.tab_config, text="📋 Inspeccionar Archivo config.json", command=self._ver_config_json).pack(anchor=tk.W, pady=10)
 
         def _actualizar_sugerencia_destino(self, nombre_proyecto: str):
-            """Sugiere una ruta de destino automática si la casilla está vacía."""
             destino_usb = USBDetector.buscar_proyecto_en_usb(nombre_proyecto)
             ruta_sugerida = str(destino_usb) if destino_usb else str(DIR_BACKUPS / nombre_proyecto / "MASTER")
             self.entry_destino_respaldo.delete(0, tk.END)
@@ -862,11 +996,11 @@ if GUI_AVAILABLE:
             perfil = self.config.get_perfil(nombre)
             if perfil:
                 self.lbl_ruta_origen.config(text=f"Ruta seleccionada: {perfil.get('ruta_local', '')}")
-                
-                # Si el perfil ya tiene una ruta de destino guardada, la cargamos
                 ruta_destino_guardada = perfil.get("ruta_destino", "")
+                
+                # Limpiar y actualizar la caja de texto del destino con la ruta guardada o sugerida
+                self.entry_destino_respaldo.delete(0, tk.END)
                 if ruta_destino_guardada:
-                    self.entry_destino_respaldo.delete(0, tk.END)
                     self.entry_destino_respaldo.insert(0, ruta_destino_guardada)
                 else:
                     self._actualizar_sugerencia_destino(nombre)
@@ -932,39 +1066,58 @@ if GUI_AVAILABLE:
             msg = f"¿Iniciar operación de Respaldo?\n\n• Proyecto: {nombre}\n• Origen: {origen}\n• Destino: {destino}\n• Modo: {modo.upper()}"
             if not messagebox.askyesno("Confirmación de Operación", msg):
                 return
+                
+            # --- CAMBIO AQUÍ: Indicar estado inicial limpio sin bucle infinito bloqueante ---
+            self.progress_bar.stop()
+            self.progress_bar.config(mode="indeterminate")
+            self.progress_bar.start(10)
+            self.lbl_progreso.config(text="Estado: Analizando directorios y preparando respaldo...")
+            self.lbl_archivo_actual.config(text="Por favor espere...")
 
             threading.Thread(
                 target=self._worker_respaldo,
                 args=(nombre, origen, destino, modo, password, compression_level),
                 daemon=True
             ).start()
-
+            
         def _worker_respaldo(self, nombre, origen, destino, modo, password, compression_level):
             def cb_progreso(idx, total, cop, del_, err, arch):
+                # Asegurar que cambia a modo determinado al empezar la copia real
+                self.ui_queue.put(("set_determinate", (total,)))
                 self.ui_queue.put(("progress", (idx, total, cop, del_, err, arch)))
 
-            if destino.exists() and any(destino.iterdir()) and modo == "espejo":
-                self.engine.crear_backup_zip(
-                    destino, nombre, password, compression_level, self.log_gui
+            def cb_log_custom(msg):
+                self.log_gui(msg)
+                self.ui_queue.put(("status_text", (msg,)))
+
+            try:
+                # Si existe destino y es modo espejo, el ZIP previo puede tardar sin avisar
+                if destino.exists() and any(destino.iterdir()) and modo == "espejo":
+                    cb_log_custom("📦 Comprimiendo estado anterior en ZIP (esto puede tardar unos segundos)...")
+                    self.engine.crear_backup_zip(destino, nombre, password, compression_level, cb_log_custom)
+
+                cb_log_custom("🔍 Escaneando archivos de origen...")
+                
+                copiados, eliminados, errores = self.engine.sincronizar(
+                    origen, destino, modo,
+                    callback_progreso=cb_progreso,
+                    callback_log=cb_log_custom
                 )
 
-            copiados, eliminados, errores = self.engine.sincronizar(
-                origen, destino, modo,
-                callback_progreso=cb_progreso,
-                callback_log=self.log_gui
-            )
-
-            # AHORA INCLUIMOS 'destino' AL ACTUALIZAR EL PERFIL
-            self.config.set_perfil(
-                nombre, 
-                origen, 
-                ruta_destino=destino, 
-                metadatos={"ultima_sincronizacion": datetime.now().isoformat()}
-            )
-            
-            self.ui_queue.put(("msgbox", ("Respaldo Finalizado", f"Operación completada exitosamente.\n\nArchivos copiados: {copiados}\nEliminados: {eliminados}\nErrores: {errores}")))
-            self.ui_queue.put(("refresh", None))
-
+                self.config.set_perfil(
+                    nombre, 
+                    origen, 
+                    ruta_destino=destino, 
+                    metadatos={"ultima_sincronizacion": datetime.now().isoformat()}
+                )
+                
+                self.ui_queue.put(("msgbox", ("Respaldo Finalizado", f"Operación completada exitosamente.\n\nArchivos copiados: {copiados}\nEliminados: {eliminados}\nErrores: {errores}")))
+            except Exception as e:
+                self.ui_queue.put(("msgbox_error", ("Error Crítico", f"Ocurrió un error durante el proceso:\n{e}")))
+            finally:
+                self.ui_queue.put(("stop_progress", None))
+                self.ui_queue.put(("refresh", None))
+                
         def _actualizar_lista_proyectos_usb(self):
             proyectos = set()
             for usb in USBDetector.listar_unidades_extraibles():
@@ -1191,9 +1344,8 @@ def modo_tui():
                 
                 engine.sincronizar(origen, destino, modo, callback_log=log_tui)
                 
-                # Guardar el perfil incluyendo la ruta de destino
                 config.set_perfil(nombre, origen, ruta_destino=destino)
-                
+
             input("\nPresione ENTER para continuar...")
 
         elif opcion == "2":
