@@ -18,6 +18,7 @@ from typing import Optional, Callable, List, Tuple, Dict, Any
 import tempfile
 import getpass
 
+
 # Activar alta densidad de píxeles (High DPI) en Windows si está disponible
 if platform.system() == "Windows":
     try:
@@ -85,6 +86,28 @@ BANNER = f"""{Color.CYAN} ██████╗ ██████╗ ███�
                    Versión: {Color.BOLD}{VERSION}{Color.RESET} | Max Backups: {Color.BOLD}{MAX_BACKUPS}{Color.RESET}
                    Equipo Local: {Color.AZUL}{socket.gethostname()}{Color.RESET} ({platform.system()} {platform.release()})
 {Color.AMARILLO}   ------------------------------------------------------------{Color.RESET}"""
+
+def validar_espacio_disponible(origen: Path, destino: Path) -> tuple[bool, str]:
+    """Calcula el tamaño del origen y verifica si cabe en la unidad de destino."""
+    try:
+        # 1. Calcular tamaño total a transferir
+        if origen.is_file():
+            tamano_total = origen.stat().st_size
+        else:
+            tamano_total = sum(f.stat().st_size for f in origen.rglob('*') if f.is_file())
+
+        # 2. Obtener espacio libre en el destino
+        unidad_destino = destino.anchor if destino.exists() else destino.parent.anchor
+        _, _, libre = shutil.disk_usage(unidad_destino)
+
+        if libre < tamano_total:
+            tam_mb = tamano_total / (1024 * 1024)
+            lib_mb = libre / (1024 * 1024)
+            return False, f"Espacio insuficiente. Requerido: {tam_mb:.1f} MB | Disponible: {lib_mb:.1f} MB"
+
+        return True, "OK"
+    except Exception as e:
+        return True, f"No se pudo verificar el espacio: {e}"
 
 def get_base_dir() -> Path:
     """Obtiene la ruta raíz del ejecutable o del script de origen."""
@@ -322,42 +345,7 @@ class SecurityUtils:
                 destino.unlink()
             return False
 
-    @staticmethod
-    def descifrar_archivo(origen: Path, destino: Path, password: str) -> bool:
-        if not CRYPTO_AVAILABLE:
-            raise RuntimeError("La librería PyCryptodome no está instalada.")
-        try:
-            file_size = origen.stat().st_size
-            if file_size < 32:
-                return False
-
-            with open(origen, 'rb') as f_in:
-                salt = f_in.read(16)
-                iv = f_in.read(16)
-                key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
-                cipher = AES.new(key, AES.MODE_CBC, iv)
-
-                with open(destino, 'wb') as f_out:
-                    buffer = b""
-                    while True:
-                        chunk = f_in.read(CHUNK_SIZE)
-                        if not chunk:
-                            if buffer:
-                                f_out.write(unpad(cipher.decrypt(buffer), AES.block_size))
-                            break
-                        buffer += chunk
-                        if len(buffer) > AES.block_size * 2:
-                            to_decrypt = buffer[:-AES.block_size * 2]
-                            buffer = buffer[-AES.block_size * 2:]
-                            f_out.write(cipher.decrypt(to_decrypt))
-            return True
-        except Exception as e:
-            logger.error(f"Error al descifrar archivo {origen}: {e}")
-            if destino.exists():
-                destino.unlink()
-            return False
-
-# --- Motor de Sincronización y Respaldo ---
+            # --- Motor de Sincronización y Respaldo ---
 class SyncEngine:
     """Motor central de operaciones de copia, verificación de integridad y compresión."""
     def __init__(self, config: ConfigManager):
@@ -920,16 +908,24 @@ if GUI_AVAILABLE:
             btn_exec.pack(anchor=tk.E, pady=15)
 
         def _build_tab_restaurar(self):
+            # 1. Selección del proyecto en USB
             card_origen = ttk.LabelFrame(self.tab_restaurar, text=" 1. Proyecto a Recuperar desde USB ", padding=10)
             card_origen.pack(fill=tk.X, pady=5)
 
             row = ttk.Frame(card_origen)
             row.pack(fill=tk.X)
-            self.combo_proyectos_restaurar = ttk.Combobox(row, state="readonly", font=self.font_normal)
+
+            # Quitamos state="readonly" para permitir ingresar una ruta manualmente
+            self.combo_proyectos_restaurar = ttk.Combobox(row, font=self.font_normal) 
             self.combo_proyectos_restaurar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+            self.combo_proyectos_restaurar.bind("<<ComboboxSelected>>", self._on_proyecto_restaurar_selected)
+            
+            # Añadimos el botón de búsqueda manual
+            ttk.Button(row, text="📁 Buscar Carpeta USB...", command=self._browse_origen_restaurar).pack(side=tk.LEFT, padx=2)
             ttk.Button(row, text="🔍 Escanear Unidades USB", command=self._actualizar_lista_proyectos_usb).pack(side=tk.LEFT)
 
-            card_destino = ttk.LabelFrame(self.tab_restaurar, text=" 2. Carpeta Destino en el Ordenador ", padding=10)
+            # 2. Selección de la carpeta de destino local (PC)
+            card_destino = ttk.LabelFrame(self.tab_restaurar, text=" 2. Carpeta Destino en el Ordenador (PC) ", padding=10)
             card_destino.pack(fill=tk.X, pady=10)
 
             row2 = ttk.Frame(card_destino)
@@ -938,21 +934,139 @@ if GUI_AVAILABLE:
             self.entry_destino_restaurar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
             ttk.Button(row2, text="📁 Buscar...", command=self._browse_destino_restaurar).pack(side=tk.LEFT)
 
-            card_opciones = ttk.LabelFrame(self.tab_restaurar, text=" 3. Método de Restauración ", padding=10)
-            card_opciones.pack(fill=tk.X, pady=5)
+            # 3. Origen de restauración (Datos directos vs Copia ZIP)
+            card_origen_datos = ttk.LabelFrame(self.tab_restaurar, text=" 3. ¿De dónde quieres restaurar? ", padding=10)
+            card_origen_datos.pack(fill=tk.X, pady=5)
 
-            self.var_restaurar_zip = tk.BooleanVar(value=True)
-            ttk.Checkbutton(
-                card_opciones, text="📦 Restaurar desde el último paquete ZIP comprimido", variable=self.var_restaurar_zip
-            ).pack(anchor=tk.W)
-            ttk.Label(card_opciones, text="   Restaura el estado exacto del proyecto en un punto previo en el tiempo.", font=self.font_sub).pack(anchor=tk.W, pady=(0, 5))
+            self.var_modo_origen_restauracion = tk.StringVar(value="directo")
 
-            self.var_espejo_restaurar = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
-                card_opciones, text="🧹 Modo Limpieza en PC (Borrar archivos locales no presentes en el USB)", variable=self.var_espejo_restaurar
-            ).pack(anchor=tk.W)
+            r_directo = ttk.Radiobutton(
+                card_origen_datos, 
+                text="📂 Restaurar datos del USB (archivos directos sincronizados)", 
+                value="directo", 
+                variable=self.var_modo_origen_restauracion,
+                command=self._toggle_origen_restauracion
+            )
+            r_directo.pack(anchor=tk.W)
+            ttk.Label(card_origen_datos, text="   Copia la estructura de carpetas y archivos visibles directamente desde el USB al PC.", font=self.font_sub).pack(anchor=tk.W, pady=(0, 5))
 
-            ttk.Button(self.tab_restaurar, text="📥 INICIAR RESTAURACIÓN", command=self._iniciar_restauracion).pack(anchor=tk.E, pady=15)
+            r_zip = ttk.Radiobutton(
+                card_origen_datos, 
+                text="📦 Restaurar desde una copia guardada (.zip / .zip.enc)", 
+                value="zip", 
+                variable=self.var_modo_origen_restauracion,
+                command=self._toggle_origen_restauracion
+            )
+            r_zip.pack(anchor=tk.W)
+            ttk.Label(card_origen_datos, text="   Descomprime un paquete de copia de seguridad histórico guardado en el USB.", font=self.font_sub).pack(anchor=tk.W, pady=(0, 5))
+
+            # Selector de archivo ZIP (se activa solo si selecciona la opción ZIP)
+            self.frame_selector_zip = ttk.Frame(card_origen_datos, padding=(20, 5, 0, 0))
+            ttk.Label(self.frame_selector_zip, text="Seleccionar archivo de backup:").pack(side=tk.LEFT, padx=(0, 5))
+            self.combo_zips_disponibles = ttk.Combobox(self.frame_selector_zip, state="readonly", width=45)
+            self.combo_zips_disponibles.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            ttk.Button(self.tab_restaurar, text="📥 INICIAR RESTAURACIÓN EN PC", command=self._iniciar_restauracion).pack(anchor=tk.E, pady=15)
+
+        def _toggle_origen_restauracion(self):
+            """Muestra u oculta la selección de archivos ZIP según la opción elegida."""
+            if self.var_modo_origen_restauracion.get() == "zip":
+                self.frame_selector_zip.pack(fill=tk.X)
+            else:
+                self.frame_selector_zip.pack_forget()
+
+        def _on_proyecto_restaurar_selected(self, event):
+            nombre = self.combo_proyectos_restaurar.get()
+            if not nombre:
+                return
+
+            carpeta_usb = USBDetector.buscar_proyecto_en_usb(nombre)
+            if carpeta_usb:
+                # CORRECCIÓN: Buscar los zips dentro de la carpeta del proyecto (carpeta_usb), no en parent
+                zips = sorted(list(carpeta_usb.glob("backup_*.zip*")), key=lambda x: x.stat().st_mtime, reverse=True)
+                self.combo_zips_disponibles['values'] = [f.name for f in zips]
+                if zips:
+                    self.combo_zips_disponibles.current(0)
+                else:
+                    self.combo_zips_disponibles['values'] = ["No hay copias .zip encontradas"]
+
+        def _iniciar_restauracion(self):
+            nombre_o_ruta = self.combo_proyectos_restaurar.get()
+            if not nombre_o_ruta:
+                messagebox.showerror("Error", "Seleccione o busque un proyecto para restaurar.")
+                return
+
+            destino_str = self.entry_destino_restaurar.get().strip()
+            if not destino_str:
+                messagebox.showerror("Error", "Especifique una carpeta de destino en su PC.")
+                return
+
+            destino = Path(destino_str)
+            
+            # Validar si el texto introducido es una ruta absoluta válida seleccionada manualmente
+            if Path(nombre_o_ruta).is_absolute() and Path(nombre_o_ruta).exists():
+                origen_usb = Path(nombre_o_ruta)
+            else:
+                origen_usb = USBDetector.buscar_proyecto_en_usb(nombre_o_ruta)
+
+            if self.var_modo_origen_restauracion.get() == "directo":
+                if not origen_usb or not origen_usb.exists():
+                    messagebox.showerror("Error", "No se encontró la carpeta del proyecto en el USB.")
+                    return
+
+                if messagebox.askyesno("Confirmar", f"Restaurar directamente desde:\n{origen_usb}\nHacia:\n{destino}"):
+                    threading.Thread(
+                        target=self._worker_restauracion_directa, 
+                        args=(origen_usb, destino), 
+                        daemon=True
+                    ).start()
+
+            else: # Modo ZIP
+                zip_nombre = self.combo_zips_disponibles.get()
+                if not zip_nombre or "No hay copias" in zip_nombre:
+                    messagebox.showerror("Error", "Seleccione un archivo comprimido válido.")
+                    return
+
+                # CORRECCIÓN: Apuntar directamente a origen_usb / zip_nombre
+                ruta_zip = origen_usb / zip_nombre if origen_usb else None
+                if not ruta_zip or not ruta_zip.exists():
+                    messagebox.showerror("Error", f"No se encontró el archivo {zip_nombre} en la unidad USB.")
+                    return
+
+                password = None
+                if ruta_zip.suffix == ".enc":
+                    password = simpledialog.askstring("Clave Requerida", "Ingrese la clave para descifrar el backup:", show='*')
+                    if password is None:
+                        return
+
+                if messagebox.askyesno("Confirmar", f"Descomprimir paquete:\n{zip_nombre}\nHacia:\n{destino}"):
+                    threading.Thread(
+                        target=self._worker_restauracion_backup, 
+                        args=(ruta_zip, destino, password), 
+                        daemon=True
+                    ).start()
+
+        def _worker_restauracion_directa(self, origen, destino):
+            self.progress_bar.config(mode="indeterminate")
+            self.progress_bar.start(10)
+            try:
+                self.log_gui("📊 Verificando espacio disponible en la partición del PC...")
+                
+                # --- LLAMADA A LA VALIDACIÓN ---
+                es_valido, mensaje = validar_espacio_disponible(origen, destino)
+                if not es_valido:
+                    self.ui_queue.put(("msgbox_error", ("Espacio Insuficiente en PC", f"No se puede restaurar:\n\n{mensaje}")))
+                    return
+
+                copiados, eliminados, errores = self.engine.sincronizar(
+                    origen, destino, modo="incremental", callback_log=self.log_gui
+                )
+                self.ui_queue.put(("msgbox", ("Restauración Completada", f"Se han copiado los datos directamente desde el USB al PC.\nArchivos copiados: {copiados}\nErrores: {errores}")))
+            except Exception as e:
+                self.ui_queue.put(("msgbox_error", ("Error", f"Fallo al restaurar: {e}")))
+            finally:
+                self.ui_queue.put(("stop_progress", None))
+                self.ui_queue.put(("refresh", None))
 
         def _build_tab_backups(self):
             ttk.Label(self.tab_backups, text="Puntos de Restauración Comprimidos Almacenados:", font=self.font_bold).pack(anchor=tk.W, pady=5)
@@ -1138,10 +1252,13 @@ if GUI_AVAILABLE:
                 self.ui_queue.put(("status_text", (msg,)))
 
             try:
-                # Si existe destino y es modo espejo, el ZIP previo puede tardar sin avisar
-                if destino.exists() and any(destino.iterdir()) and modo == "espejo":
-                    cb_log_custom("📦 Comprimiendo estado anterior en ZIP (esto puede tardar unos segundos)...")
-                    self.engine.crear_backup_zip(destino, nombre, password, compression_level, cb_log_custom)
+                cb_log_custom("📊 Calculando tamaño y verificando espacio en disco...")
+                
+                # --- LLAMADA A LA VALIDACIÓN ---
+                es_valido, mensaje = validar_espacio_disponible(origen, destino)
+                if not es_valido:
+                    self.ui_queue.put(("msgbox_error", ("Espacio Insuficiente", f"No se puede realizar el respaldo:\n\n{mensaje}")))
+                    return
 
                 cb_log_custom("🔍 Escaneando archivos de origen...")
                 
@@ -1190,46 +1307,32 @@ if GUI_AVAILABLE:
             if folder:
                 self.entry_destino_restaurar.delete(0, tk.END)
                 self.entry_destino_restaurar.insert(0, folder)
-
-        def _iniciar_restauracion(self):
-            nombre = self.combo_proyectos_restaurar.get()
-            if not nombre:
-                messagebox.showerror("Error", "Seleccione un proyecto para restaurar.")
-                return
-            destino_str = self.entry_destino_restaurar.get()
-            if not destino_str:
-                messagebox.showerror("Error", "Especifique una carpeta de destino en su PC.")
-                return
-
-            destino = Path(destino_str)
-            origen_usb = USBDetector.buscar_proyecto_en_usb(nombre) or (DIR_BACKUPS / nombre / "MASTER")
-
-            if self.var_restaurar_zip.get():
-                backups = sorted(origen_usb.parent.glob("backup_*.zip*"), key=lambda x: x.stat().st_mtime, reverse=True)
-                if backups:
-                    ultimo_zip = backups[0]
-                    if messagebox.askyesno("Restaurar desde Paquete", f"Se encontró el punto de respaldo:\n{ultimo_zip.name}\n\n¿Restaurar desde este paquete comprimido?"):
-                        password = None
-                        if ultimo_zip.suffix == ".enc":
-                            password = simpledialog.askstring("Contraseña requerida", "Ingrese la clave para descifrar el backup:", show='*')
-                            if password is None:
-                                return
-                        threading.Thread(target=self._worker_restauracion_backup, args=(ultimo_zip, destino, password), daemon=True).start()
-                        return
-
-            espejo = self.var_espejo_restaurar.get()
-            threading.Thread(target=self._worker_restauracion, args=(origen_usb, destino, espejo), daemon=True).start()
-
-        def _worker_restauracion(self, origen, destino, espejo):
-            modo = "espejo" if espejo else "incremental"
-            self.engine.sincronizar(origen, destino, modo, callback_log=self.log_gui)
-            self.ui_queue.put(("msgbox", ("Éxito", "Restauración directa completada.")))
-            self.ui_queue.put(("refresh", None))
-
+        
+        def _browse_origen_restaurar(self):
+            folder = filedialog.askdirectory(title="Seleccione la carpeta en el USB que contiene los datos sincronizados")
+            if folder:
+                self.combo_proyectos_restaurar.set(folder)
+                
         def _worker_restauracion_backup(self, ruta_zip, destino, password):
-            self.engine.restaurar_desde_backup(ruta_zip, destino, password, self.log_gui)
-            self.ui_queue.put(("msgbox", ("Éxito", "Restauración desde paquete ZIP completada.")))
-            self.ui_queue.put(("refresh", None))
+            self.progress_bar.config(mode="indeterminate")
+            self.progress_bar.start(10)
+            try:
+                self.log_gui("📊 Verificando espacio disponible para descomprimir...")
+                
+                # --- LLAMADA A LA VALIDACIÓN ---
+                es_valido, mensaje = validar_espacio_disponible(ruta_zip, destino)
+                if not es_valido:
+                    self.ui_queue.put(("msgbox_error", ("Espacio Insuficiente en PC", f"No se puede descomprimir el respaldo:\n\n{mensaje}")))
+                    return
+
+                exito = self.engine.restaurar_desde_backup(ruta_zip, destino, password, self.log_gui)
+                if exito:
+                    self.ui_queue.put(("msgbox", ("Éxito", "Restauración desde paquete ZIP completada.")))
+            except Exception as e:
+                self.ui_queue.put(("msgbox_error", ("Error", f"Fallo en la restauración: {e}")))
+            finally:
+                self.ui_queue.put(("stop_progress", None))
+                self.ui_queue.put(("refresh", None))
 
         def _eliminar_backup(self):
             sel = self.tree_backups.selection()
@@ -1394,9 +1497,7 @@ def modo_tui():
                 password = getpass.getpass("Ingrese contraseña de cifrado: ")
 
             if input(f"¿Confirmar respaldo del proyecto '{nombre}' en '{destino}'? (s/N): ").strip().lower() == 's':
-                if destino.exists() and any(destino.iterdir()) and modo == "espejo":
-                    engine.crear_backup_zip(destino, nombre, password, config.get_opcion("compresion", 6), log_tui)
-                
+                                
                 engine.sincronizar(origen, destino, modo, callback_log=log_tui)
                 
                 # --- PREGUNTAR SI SE DESEA CREAR LA COPIA DE SEGURIDAD ZIP ---
