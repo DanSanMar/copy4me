@@ -47,7 +47,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "3.6-test"
+VERSION = "4 test"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -369,25 +369,26 @@ class SyncEngine:
                 continue
         return False
 
-    def _copiar_con_reintentos(self, src: Path, dst: Path, max_attempts=3) -> bool:
+    def _copiar_con_reintentos(self, src: Path, dst: Path, max_attempts=3, callback_log: Optional[Callable] = None) -> tuple[bool, str]:
         for attempt in range(max_attempts):
             try:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 if dst.exists():
+                    # Comprobamos si son idénticos para saber si se omite o se actualiza
                     if src.stat().st_size == dst.stat().st_size and abs(src.stat().st_mtime - dst.stat().st_mtime) <= 2.0:
-                        return True
+                        return True, "omitido" # El archivo no cambió
+                
                 shutil.copy2(src, dst)
                 if self.config.get_opcion("verificar_hash", True):
                     h_src = SecurityUtils.calcular_hash(src)
                     h_dst = SecurityUtils.calcular_hash(dst)
                     if h_src and h_dst and h_src != h_dst:
                         raise ValueError("Incoincidencia de Hash SHA-256")
-                return True
+                return True, "copiado"
             except Exception as e:
                 logger.warning(f"Intento {attempt+1}/{max_attempts} fallido para {src.name}: {e}")
                 time.sleep(0.3 * (attempt + 1))
-        logger.error(f"Error persistente. No se pudo copiar: {src}")
-        return False
+        return False, "error"
 
     def sincronizar(self, origen: Path, destino: Path, modo: str = "espejo",
                     callback_progreso: Optional[Callable] = None,
@@ -404,12 +405,30 @@ class SyncEngine:
             return 0, 0, 1
 
         archivos_origen = []
+        directorios_origen = []
+        
         for root, dirs, files in os.walk(origen):
             dirs[:] = [d for d in dirs if not self._excluir_archivo(Path(root) / d)]
+            
+            # Recopilar carpetas para asegurar que se repliquen aunque estén vacías
+            for d in dirs:
+                r_dir = Path(root) / d
+                if not self._excluir_archivo(r_dir):
+                    directorios_origen.append(r_dir)
+
             for f in files:
                 r = Path(root) / f
                 if not self._excluir_archivo(r):
                     archivos_origen.append(r)
+
+        # Crear las carpetas en el destino antes de procesar los archivos
+        for dir_src in directorios_origen:
+            rel_dir = dir_src.relative_to(origen)
+            dir_dst = destino / rel_dir
+            try:
+                dir_dst.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"No se pudo crear la carpeta vacía {rel_dir}: {e}")
 
         total = len(archivos_origen)
         copiados, eliminados, errores = 0, 0, 0
@@ -419,10 +438,20 @@ class SyncEngine:
             dst = destino / rel
             if callback_progreso:
                 callback_progreso(idx, total, copiados, eliminados, errores, str(rel))
-            if self._copiar_con_reintentos(src, dst):
-                copiados += 1
+            
+            # Recibimos el estado de la acción
+            exito, estado = self._copiar_con_reintentos(src, dst, callback_log=callback_log)
+            
+            if exito:
+                if estado == "copiado":
+                    copiados += 1
+                    if callback_log:
+                        callback_log(f"➕ Copiado/Actualizado: {rel}")
+                # Si fue "omitido", no incrementamos el contador de copiados falsos para ver la realidad
             else:
                 errores += 1
+                if callback_log:
+                    callback_log(f"❌ Error al copiar: {rel}")
 
         if modo in ("espejo", "bidireccional") and destino.exists():
             for root, _, files in os.walk(destino):
@@ -448,6 +477,23 @@ class SyncEngine:
                                     callback_log(f"🔄 Recuperado a Origen (Bidireccional): {rel}")
                             else:
                                 errores += 1
+
+            # --- NUEVO: Limpieza de directorios vacíos en modo espejo ---
+            if modo == "espejo":
+                for root, dirs, files in os.walk(destino, topdown=False):
+                    for d in dirs:
+                        dir_dst = Path(root) / d
+                        rel_dir = dir_dst.relative_to(destino)
+                        src_dir = origen / rel_dir
+                        # Si la carpeta ya no existe en el origen o está vacía y no tiene correspondencia, se limpia
+                        if not src_dir.exists():
+                            try:
+                                if not any(dir_dst.iterdir()):
+                                    dir_dst.rmdir()
+                                    if callback_log:
+                                        callback_log(f"🗑️ Carpeta vacía eliminada en destino: {rel_dir}")
+                            except Exception as e:
+                                logger.warning(f"No se pudo eliminar la carpeta vacía {dir_dst}: {e}")
 
         if callback_log:
             callback_log(f"✅ Sincronización finalizada. Copiados: {copiados}, Eliminados: {eliminados}, Errores: {errores}")
@@ -1050,7 +1096,9 @@ if GUI_AVAILABLE:
             self.progress_bar.config(mode="indeterminate")
             self.progress_bar.start(10)
             try:
-                self.log_gui("📊 Verificando espacio disponible en la partición del PC...")
+                # Notificar visualmente en la barra de estados
+                self.ui_queue.put(("status_text", ("Calculando tamaño de archivos para restaurar...",)))
+                self.log_gui("📊 Verificando tamaño de origen y espacio disponible en la partición del PC...")
                 
                 # --- LLAMADA A LA VALIDACIÓN ---
                 es_valido, mensaje = validar_espacio_disponible(origen, destino)
@@ -1243,7 +1291,6 @@ if GUI_AVAILABLE:
             
         def _worker_respaldo(self, nombre, origen, destino, modo, password, compression_level):
             def cb_progreso(idx, total, cop, del_, err, arch):
-                # Asegurar que cambia a modo determinado al empezar la copia real
                 self.ui_queue.put(("set_determinate", (total,)))
                 self.ui_queue.put(("progress", (idx, total, cop, del_, err, arch)))
 
@@ -1252,15 +1299,17 @@ if GUI_AVAILABLE:
                 self.ui_queue.put(("status_text", (msg,)))
 
             try:
-                cb_log_custom("📊 Calculando tamaño y verificando espacio en disco...")
+                # Mostrar en pantalla la acción de comprobación de espacio antes de validar
+                cb_log_custom("📊 Calculando tamaño total del origen y verificando espacio disponible en disco...")
+                self.ui_queue.put(("status_text", ("Comprobando tamaño y espacio disponible...",)))
                 
-                # --- LLAMADA A LA VALIDACIÓN ---
+                # --- VALIDACIÓN DE TAMAÑO Y ESPACIO ---
                 es_valido, mensaje = validar_espacio_disponible(origen, destino)
                 if not es_valido:
                     self.ui_queue.put(("msgbox_error", ("Espacio Insuficiente", f"No se puede realizar el respaldo:\n\n{mensaje}")))
                     return
 
-                cb_log_custom("🔍 Escaneando archivos de origen...")
+                cb_log_custom("✅ Comprobación de tamaño exitosa. Escaneando archivos de origen...")
                 
                 copiados, eliminados, errores = self.engine.sincronizar(
                     origen, destino, modo,
@@ -1278,7 +1327,6 @@ if GUI_AVAILABLE:
                     }
                 )
 
-                # --- PREGUNTAR SI SE DESEA CREAR LA COPIA DE SEGURIDAD ZIP ---
                 if messagebox.askyesno("Copia de Seguridad", "¿Desea generar una copia de seguridad (.zip) de esta sincronización?"):
                     cb_log_custom("📦 Generando archivo ZIP de copia de seguridad...")
                     self.engine.crear_backup_zip(origen, nombre, password, compression_level, cb_log_custom)
@@ -1317,7 +1365,9 @@ if GUI_AVAILABLE:
             self.progress_bar.config(mode="indeterminate")
             self.progress_bar.start(10)
             try:
-                self.log_gui("📊 Verificando espacio disponible para descomprimir...")
+                # Notificar visualmente en la barra de estados
+                self.ui_queue.put(("status_text", ("Calculando tamaño de archivos para restaurar...",)))
+                self.log_gui("📊 Verificando tamaño de origen y espacio disponible en la partición del PC...")
                 
                 # --- LLAMADA A LA VALIDACIÓN ---
                 es_valido, mensaje = validar_espacio_disponible(ruta_zip, destino)
