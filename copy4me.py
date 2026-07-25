@@ -273,20 +273,51 @@ class SecurityUtils:
                     chunk = f_in.read(CHUNK_SIZE)
                     if len(chunk) == 0:
                         break
-                    elif len(chunk) % AES.block_size != 0:
+                    elif len(chunk) < CHUNK_SIZE:
                         f_out.write(cipher.encrypt(pad(chunk, AES.block_size)))
                         break
                     else:
-                        if len(chunk) < CHUNK_SIZE:
-                            f_out.write(cipher.encrypt(pad(chunk, AES.block_size)))
-                            break
-                        else:
-                            f_out.write(cipher.encrypt(chunk))
-                else:
+                        f_out.write(cipher.encrypt(chunk))
+                # Si el archivo era un múltiplo exacto de CHUNK_SIZE, enviamos el bloque final con pad
+                if len(chunk) == CHUNK_SIZE:
                     f_out.write(cipher.encrypt(pad(b"", AES.block_size)))
             return True
         except Exception as e:
             logger.error(f"Error al cifrar archivo {origen}: {e}")
+            if destino.exists():
+                destino.unlink()
+            return False
+
+    @staticmethod
+    def descifrar_archivo(origen: Path, destino: Path, password: str) -> bool:
+        if not CRYPTO_AVAILABLE:
+            raise RuntimeError("La librería PyCryptodome no está instalada.")
+        try:
+            file_size = origen.stat().st_size
+            if file_size < 32:
+                return False
+
+            with open(origen, 'rb') as f_in:
+                salt = f_in.read(16)
+                iv = f_in.read(16)
+                key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
+                cipher = AES.new(key, AES.MODE_CBC, iv)
+
+                with open(destino, 'wb') as f_out:
+                    prev_chunk = None
+                    while True:
+                        chunk = f_in.read(CHUNK_SIZE)
+                        if not chunk:
+                            if prev_chunk:
+                                # El último fragmento leído contiene el Padding de AES
+                                f_out.write(unpad(cipher.decrypt(prev_chunk), AES.block_size))
+                            break
+                        if prev_chunk:
+                            f_out.write(cipher.decrypt(prev_chunk))
+                        prev_chunk = chunk
+            return True
+        except Exception as e:
+            logger.error(f"Error al descifrar archivo {origen}: {e}")
             if destino.exists():
                 destino.unlink()
             return False
@@ -679,9 +710,8 @@ class SyncEngine:
                     with zipfile.ZipFile(target_hist_zip, 'r') as zf:
                         for member in zf.infolist():
                             if member.filename in archivos_a_extraer:
-                                target_path = Path(destino_dir) / member.filename
-                                # Prevención de vulnerabilidad Zip Slip
-                                if target_path.resolve().is_relative_to(destino_dir.resolve()):
+                                target_path = (destino_dir / member.filename).resolve()
+                                if str(target_path).startswith(str(destino_dir.resolve())):
                                     zf.extract(member, destino_dir)
                 finally:
                     if temp_hist_path and temp_hist_path.exists():
@@ -843,7 +873,8 @@ if GUI_AVAILABLE:
 
             ttk.Button(row1, text="📁 Seleccionar Carpeta...", command=self._browse_origen).pack(side=tk.LEFT, padx=2)
             ttk.Button(row1, text="❌ Borrar Perfil", command=self._eliminar_perfil).pack(side=tk.LEFT, padx=2)
-
+            ttk.Button(row1, text="🔁 Repetir Acción", command=self._iniciar_respaldo).pack(side=tk.LEFT, padx=2) 
+               
             self.lbl_ruta_origen = ttk.Label(card_origen, text="Ruta seleccionada: (Ninguna)", font=self.font_sub)
             self.lbl_ruta_origen.pack(anchor=tk.W, pady=(5, 0))
 
@@ -998,18 +1029,34 @@ if GUI_AVAILABLE:
                 self.lbl_ruta_origen.config(text=f"Ruta seleccionada: {perfil.get('ruta_local', '')}")
                 ruta_destino_guardada = perfil.get("ruta_destino", "")
                 
-                # Limpiar y actualizar la caja de texto del destino con la ruta guardada o sugerida
                 self.entry_destino_respaldo.delete(0, tk.END)
                 if ruta_destino_guardada:
                     self.entry_destino_respaldo.insert(0, ruta_destino_guardada)
                 else:
                     self._actualizar_sugerencia_destino(nombre)
+                    
+                ultimo_modo = perfil.get("ultimo_modo")
+                if ultimo_modo in ["incremental", "espejo", "bidireccional"]:
+                    self.var_modo_respaldo.set(ultimo_modo)
+               
 
         def _browse_origen(self):
             folder = filedialog.askdirectory(title="Selecciona la carpeta raíz a respaldar")
             if folder:
                 folder_path = Path(folder)
-                nombre = folder_path.name
+                
+                # --- CAMBIO: Sugerir nombre compuesto y pedir confirmación ---
+                nombre_sugerido = f"{folder_path.name} ({folder_path.parent.name})"
+                nombre = simpledialog.askstring(
+                    "Nombre del Perfil", 
+                    "Ingrese un nombre único para este perfil:", 
+                    initialvalue=nombre_sugerido
+                )
+                
+                if not nombre:
+                    return # Si el usuario cancela, detenemos el proceso
+                # --- FIN DEL CAMBIO ---
+                
                 self.config.set_perfil(nombre, folder_path)
                 self._refresh_all()
                 self.combo_perfiles.set(nombre)
@@ -1108,9 +1155,17 @@ if GUI_AVAILABLE:
                     nombre, 
                     origen, 
                     ruta_destino=destino, 
-                    metadatos={"ultima_sincronizacion": datetime.now().isoformat()}
+                    metadatos={
+                        "ultima_sincronizacion": datetime.now().isoformat(),
+                        "ultimo_modo": modo
+                    }
                 )
-                
+
+                # --- PREGUNTAR SI SE DESEA CREAR LA COPIA DE SEGURIDAD ZIP ---
+                if messagebox.askyesno("Copia de Seguridad", "¿Desea generar una copia de seguridad (.zip) de esta sincronización?"):
+                    cb_log_custom("📦 Generando archivo ZIP de copia de seguridad...")
+                    self.engine.crear_backup_zip(origen, nombre, password, compression_level, cb_log_custom)
+
                 self.ui_queue.put(("msgbox", ("Respaldo Finalizado", f"Operación completada exitosamente.\n\nArchivos copiados: {copiados}\nEliminados: {eliminados}\nErrores: {errores}")))
             except Exception as e:
                 self.ui_queue.put(("msgbox_error", ("Error Crítico", f"Ocurrió un error durante el proceso:\n{e}")))
@@ -1344,6 +1399,11 @@ def modo_tui():
                 
                 engine.sincronizar(origen, destino, modo, callback_log=log_tui)
                 
+                # --- PREGUNTAR SI SE DESEA CREAR LA COPIA DE SEGURIDAD ZIP ---
+                crear_zip = input("¿Desea crear una copia de seguridad comprimida en ZIP? (s/N): ").strip().lower() == 's'
+                if crear_zip:
+                    engine.crear_backup_zip(origen, nombre, password, config.get_opcion("compresion", 6), log_tui)
+
                 config.set_perfil(nombre, origen, ruta_destino=destino)
 
             input("\nPresione ENTER para continuar...")
