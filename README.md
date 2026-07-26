@@ -10,22 +10,25 @@
 ## ✨ Características Principales
 
 * 🔄 **Modos de Sincronización Flexible**:
-  * **Incremental**: Copia únicamente archivos nuevos o modificados sin borrar nada.
-  * **Espejo**: Mantiene el destino $100\%$ idéntico al origen (elimina en destino lo que se haya borrado en el origen).
-  * **Bidireccional**: Sincroniza cambios en ambas direcciones.
-* 📦 **Historial de Respaldos ZIP y Rotación**:
-  * Generación de paquetes comprimidos `.zip` con rotación automática configurable.
-  * Límite predeterminado de **10 backups** para optimizar el uso de espacio.
+  * **Incremental / Normal**: Copia únicamente archivos nuevos o modificados sin borrar nada.
+  * **Espejo**: Mantiene el destino $100\%$ idéntico al origen (elimina en destino archivos y directorios vacíos que se hayan borrado en el origen).
+  * **Bidireccional**: Combina y sincroniza los cambios en ambas direcciones.
+* 📦 **Tareas Configurables y Respaldos ZIP**:
+  * Ejecución flexible: permite elegir sincronización directa de archivos, creación de paquete comprimido `.zip` o ambas opciones de manera simulatánea.
+  * Rotación automática de historiales `.zip` basada en un límite máximo configurable (por defecto 10 backups por proyecto).
+* 💾 **Validación de Espacio en Disco**:
+  * Comprobación preventiva del espacio disponible en la unidad de destino (calculando incluso el tamaño real descompreso para operaciones de restauración).
 * 🔒 **Cifrado AES-256 de Alta Seguridad**:
-  * Protección con contraseña mediante derivación de clave `PBKDF2` y cifrado por flujo por bloques `AES-CBC`.
+  * Protección opcional de paquetes `.zip` con contraseña mediante derivación de clave `PBKDF2` y cifrado por bloques `AES-256 CBC` (generando archivos `.zip.enc`).
 * 🛡️ **Verificación de Integridad SHA-256**:
-  * Comprobación estricta de hash de cada archivo tras la copia para evitar corrupción de datos.
+  * Comprobación de firma hash de cada archivo tras la copia y política de reintentos automáticos para evitar corrupción de datos.
+* 📋 **Reportes y Diagnósticos Detallados**:
+  * Consola de depuración en tiempo real y ventana emergente de resumen con el listado preciso de modificaciones realizadas al finalizar cada tarea.
 * 🔌 **Detección Automática de Unidades USB**:
-  * Identificación dinámica de unidades de almacenamiento extraíbles en Windows, Linux y macOS.
+  * Identificación dinámica de dispositivos de almacenamiento extraíbles en Windows, Linux y macOS.
 * 🖥️ **Interfaz Gráfica (GUI) y Consola (TUI)**:
-  * Interfaz rica construida en Tkinter con soporte para pantallas de alta densidad DPI.
-  * Caída automática a modo Consola (TUI) en entornos de terminal o servidores sin servidor X.
-
+  * Interfaz construida en Tkinter con adaptación de densidad de píxeles (High DPI) en Windows.
+  * Caída automática al modo Consola interactivo (TUI) en entornos de terminal sin soporte gráfico.
 ---
 
 ## 🛠️ Requisitos e Instalación
@@ -68,7 +71,8 @@ Plaintext
 copy4me/
 ├── copy4me.py               # Script principal del programa
 ├── config.json              # Configuración y perfiles (se genera automáticamente)
-├── copy4me_backups/         # Carpeta por defecto para respaldos locales e historiales
+├── copy4me_backups/         # Carpeta por defecto para respaldos locales, logs e historiales
+│   └── sync_history.log    # Registro de depuración en rotación
 ├── README.md                # Documentación del proyecto
 └── .gitignore               # Archivos excluidos del control de versiones
 ```
