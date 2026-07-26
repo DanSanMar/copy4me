@@ -62,6 +62,15 @@ python copy4me.py
     
 - Si ejecutas el script en una terminal sin soporte gráfico, se iniciará el **modo consola interactivo (TUI)** automáticamente.
     
+⚙️ Configuración y Exclusiones
+
+El sistema administra las configuraciones y perfiles de manera atómica a través del archivo config.json. Puedes personalizar parámetros como:
+
+    Exclusiones por Extensión y Regex: Ignora carpetas del sistema (.git, node_modules, venv, etc.) o archivos temporales de forma global.
+
+    Nivel de Compresión: Ajustable de 0 a 9.
+
+    Retención de Historial: Límite personalizado de backups antiguos conservados por proyecto.    
 
 ## 📁 Estructura del Proyecto
 
