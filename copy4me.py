@@ -744,7 +744,10 @@ if GUI_AVAILABLE:
                         messagebox.showerror(args[0], args[1])
                     elif task == "refresh":
                         self._refresh_all()
+                    elif task == "mostrar_reporte_detallado":
+                        self._mostrar_ventana_reporte(args[0], args[1])
                     self.ui_queue.task_done()
+                    
             except queue.Empty:
                 pass
             finally:
@@ -1247,6 +1250,9 @@ if GUI_AVAILABLE:
             ).start()
             
         def _worker_respaldo(self, nombre, origen, destino, modo, password, compression_level, hacer_directo, hacer_zip):
+            # Lista para almacenar el historial de cambios detallados
+            cambios_detallados = []
+
             def cb_progreso(idx, total, cop, del_, err, arch):
                 self.ui_queue.put(("set_determinate", (total,)))
                 self.ui_queue.put(("progress", (idx, total, cop, del_, err, arch)))
@@ -1254,6 +1260,9 @@ if GUI_AVAILABLE:
             def cb_log_custom(msg):
                 self.log_gui(msg)
                 self.ui_queue.put(("status_text", (msg,)))
+                # Guardamos los eventos relevantes para el reporte emergente
+                if any(icon in msg for icon in ["➕", "📁", "🗑️", "🔄", "❌"]):
+                    cambios_detallados.append(msg)
 
             try:
                 copiados, eliminados, errores = 0, 0, 0
@@ -1281,7 +1290,6 @@ if GUI_AVAILABLE:
                 if hacer_zip:
                     cb_log_custom("📦 Generando paquete comprimido ZIP de respaldo...")
                     
-                    # Verificación de espacio para el ZIP si no se hizo en el paso directo
                     if not hacer_directo:
                         es_valido, mensaje = validar_espacio_disponible(origen, DIR_BACKUPS)
                         if not es_valido:
@@ -1292,18 +1300,20 @@ if GUI_AVAILABLE:
                     if not archivo_zip:
                         errores += 1
 
-                # 3. NOTIFICACIÓN DE FINALIZACIÓN
-                resumen = []
+                # 3. NOTIFICACIÓN CON VENTANA EMERGENTE DETALLADA
+                resumen_header = f"Operación completada en '{nombre}'\n"
                 if hacer_directo:
-                    resumen.append(f"• Archivos sincronizados: {copiados}\n• Eliminados (espejo): {eliminados}")
+                    resumen_header += f"• Archivos procesados: {copiados} | Eliminados: {eliminados} | Errores: {errores}\n"
                 if hacer_zip:
-                    resumen.append("• Copia comprimida (.ZIP) creada con éxito.")
+                    resumen_header += "• Paquete comprimido (.ZIP) creado con éxito.\n"
 
-                mensaje_final = "Operaciones completadas con éxito:\n\n" + "\n".join(resumen)
-                if errores > 0:
-                    mensaje_final += f"\n\n⚠️ Ocurrieron {errores} advertencias o errores durante el proceso."
+                if cambios_detallados:
+                    detalle_texto = "\n".join(cambios_detallados)
+                else:
+                    detalle_texto = "No hubo cambios requeridos (los archivos y carpetas ya estaban al día)."
 
-                self.ui_queue.put(("msgbox", ("Respaldo Finalizado", mensaje_final)))
+                # Enviar orden de abrir la ventana de reporte detallado
+                self.ui_queue.put(("mostrar_reporte_detallado", (resumen_header, detalle_texto)))
 
             except Exception as e:
                 self.ui_queue.put(("msgbox_error", ("Error Crítico", f"Ocurrió un error durante el proceso:\n{e}")))
@@ -1436,6 +1446,36 @@ if GUI_AVAILABLE:
                 self.log_gui(f"🔌 Unidades detectadas: {', '.join(str(u) for u in usb)}")
             else:
                 self.log_gui("ℹ️ No se detectaron unidades externas al iniciar.")
+
+        def _mostrar_ventana_reporte(self, encabezado: str, detalle: str):
+            """Crea una ventana emergente personalizada con barra de desplazamiento para ver todos los cambios."""
+            ventana = tk.Toplevel(self)
+            ventana.title("Resumen Detallado de Operaciones")
+            ventana.geometry("850x600")
+            ventana.transient(self)
+            ventana.grab_set()
+
+            # Encabezado
+            lbl_info = ttk.Label(ventana, text=encabezado, font=self.font_bold, justify=tk.LEFT)
+            lbl_info.pack(anchor=tk.W, padx=15, pady=(15, 5))
+
+            ttk.Label(ventana, text="Detalle de cambios realizados:", font=self.font_normal).pack(anchor=tk.W, padx=15, pady=(5, 5))
+
+            # Cuadro de texto con desplazamiento para mostrar todos los cambios
+            frame_txt = ttk.Frame(ventana, padding=(15, 0, 15, 10))
+            frame_txt.pack(fill=tk.BOTH, expand=True)
+
+            txt_reporte = scrolledtext.ScrolledText(
+                frame_txt, wrap=tk.WORD, font=("Consolas", 9),
+                bg="#1e1e1e", fg="#00ffcc"
+            )
+            txt_reporte.insert(tk.END, detalle)
+            txt_reporte.config(state='disabled')
+            txt_reporte.pack(fill=tk.BOTH, expand=True)
+
+            # Botón de cierre
+            btn_cerrar = ttk.Button(ventana, text="Entendido / Cerrar", command=ventana.destroy)
+            btn_cerrar.pack(pady=10)        
 
 # --- Modo Consola / TUI (Fallback) ---
 def modo_tui():
