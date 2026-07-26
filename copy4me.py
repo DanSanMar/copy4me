@@ -49,7 +49,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "4 test"
+VERSION = "4.5 testing"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -711,15 +711,40 @@ if GUI_AVAILABLE:
             self.style = ttk.Style()
             self.style.theme_use('clam')
 
-            self.font_title = ("Segoe UI", 14, "bold")
-            self.font_sub = ("Segoe UI", 10, "italic")
-            self.font_bold = ("Segoe UI", 10, "bold")
-            self.font_normal = ("Segoe UI", 10)
+            # --- PALETA DE COLORES MEJORADA ---
+            COLOR_FONDO_VENTANA = "#f8fafc"   # Blanco/Gris muy claro (Slate 50)
+            COLOR_TARJETAS       = "#ffffff"   # Blanco puro para recuadros
+            COLOR_TEXTO_TITULO  = "#1e293b"   # Azul/Gris muy oscuro para legibilidad
+            COLOR_BOTON_PRIMARIO = "#2563eb"   # Azul moderno (Royal Blue)
+            COLOR_SELECCION      = "#0d9488"   # Teal/Verde azulado para pestaña activa
 
-            self.style.configure('TNotebook.Tab', padding=[15, 7], font=("Segoe UI", 10, "bold"))
-            self.style.configure('TLabelframe.Label', font=("Segoe UI", 11, "bold"), foreground="#2c3e50")
-            self.style.configure('TButton', font=("Segoe UI", 10), padding=5)
+            self.configure(bg=COLOR_FONDO_VENTANA)
 
+            self.font_title = ("Segoe UI", 12, "bold")
+            self.font_sub = ("Segoe UI", 9, "italic")
+            self.font_bold = ("Segoe UI", 9, "bold")
+            self.font_normal = ("Segoe UI", 9)
+
+            # Configuración del Notebook (Pestañas)
+            self.style.configure('TNotebook', background=COLOR_FONDO_VENTANA)
+            self.style.configure('TNotebook.Tab', padding=[14, 8], font=("Segoe UI", 10, "bold"))
+            self.style.map('TNotebook.Tab',
+                background=[('selected', COLOR_SELECCION), ('!selected', '#e2e8f0')],
+                foreground=[('selected', '#ffffff'), ('!selected', '#475569')]
+            )
+
+            # Configuración de los Tarjeteros (LabelFrames)
+            self.style.configure('TLabelframe', background=COLOR_TARJETAS, relief="solid", borderwidth=1, bordercolor="#cbd5e1")
+            self.style.configure('TLabelframe.Label', font=("Segoe UI", 10, "bold"), foreground=COLOR_TEXTO_TITULO, background=COLOR_TARJETAS)
+
+            # Frames generales
+            self.style.configure('TFrame', background=COLOR_FONDO_VENTANA)
+
+            # Estilos nativos para widgets TTK si decides migrar
+            self.style.configure('TLabel', background=COLOR_TARJETAS, foreground="#334155")
+            self.style.configure('TRadiobutton', background=COLOR_TARJETAS, font=("Segoe UI", 9))
+            self.style.configure('TCheckbutton', background=COLOR_TARJETAS, font=("Segoe UI", 9))
+        
         def _procesar_cola(self):
             try:
                 while True:
@@ -817,7 +842,7 @@ if GUI_AVAILABLE:
 
             self.log_text = scrolledtext.ScrolledText(
                 log_frame, height=7, state='disabled',
-                bg='#1e1e1e', fg='#00ffcc', font=("Consolas", 9)
+                bg='#0f172a', fg='#38bdf8', font=("Consolas", 9)  # Fondo azul noche oscuro con texto azul neón
             )
             self.log_text.pack(fill=tk.BOTH, expand=True)
 
@@ -1467,7 +1492,7 @@ if GUI_AVAILABLE:
 
             txt_reporte = scrolledtext.ScrolledText(
                 frame_txt, wrap=tk.WORD, font=("Consolas", 9),
-                bg="#1e1e1e", fg="#00ffcc"
+                bg="#0f172a", fg="#34d399"  # Fondo azul noche con texto verde esmeralda neón
             )
             txt_reporte.insert(tk.END, detalle)
             txt_reporte.config(state='disabled')
