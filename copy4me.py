@@ -48,7 +48,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "4.7 testing zips"
+VERSION = "4.8 testing zips and buttoms"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -388,7 +388,7 @@ class SecurityUtils:
 
     @staticmethod
     def descifrar_archivo(origen: Path, destino: Path, password: str) -> bool:
-        """Procesa el stream CBC descifrando y desaplicando padding sin romper bloques."""
+        """Procesa el stream CBC descifrando y desaplicando padding de forma segura por bloques."""
         if not CRYPTO_AVAILABLE:
             raise RuntimeError("La librería PyCryptodome no está instalada.")
         try:
@@ -402,21 +402,22 @@ class SecurityUtils:
                 key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
                 cipher = AES.new(key, AES.MODE_CBC, iv)
 
-                buffer = b""
+                # Mantener siempre un bloque de reserva previo para aplicar el des-padding al final
+                prev_chunk = None
                 while True:
                     chunk = f_in.read(CHUNK_SIZE)
                     if not chunk:
-                        if buffer:
-                            decrypted = cipher.decrypt(buffer)
+                        if prev_chunk:
+                            # Descifrar y quitar el padding PKCS7 del último bloque
+                            decrypted = cipher.decrypt(prev_chunk)
                             f_out.write(unpad(decrypted, AES.block_size))
                         break
-                    
-                    buffer += chunk
-                    if len(buffer) > AES.block_size:
-                        to_decrypt = buffer[:-AES.block_size]
-                        to_decrypt = to_decrypt[:(len(to_decrypt) // AES.block_size) * AES.block_size]
-                        f_out.write(cipher.decrypt(to_decrypt))
-                        buffer = buffer[len(to_decrypt):]
+
+                    if prev_chunk:
+                        # Descifrar bloques intermedios completos
+                        f_out.write(cipher.decrypt(prev_chunk))
+
+                    prev_chunk = chunk
 
             return True
         except Exception as e:
@@ -1005,7 +1006,7 @@ if GUI_AVAILABLE:
 
             self.var_modo_respaldo = tk.StringVar(value="incremental")
 
-            r1 = ttk.Radiobutton(card_modos, text="Modo Normal / Directo", value="incremental", variable=self.var_modo_respaldo)
+            r1 = ttk.Radiobutton(card_modos, text="Modo Normal / Directo Incremental", value="incremental", variable=self.var_modo_respaldo)
             r1.pack(anchor=tk.W)
             ttk.Label(card_modos, text="   Copia los archivos sin comprimir al directorio destino.", font=self.font_sub).pack(anchor=tk.W, pady=(0, 5))
 
@@ -1400,19 +1401,14 @@ if GUI_AVAILABLE:
                 if not password:
                     return
 
-            try:
-                tamano_bytes = sum(f.stat().st_size for f in origen.rglob('*') if f.is_file()) if origen.is_dir() else origen.stat().st_size
-                tam_legible = formatear_tamano(tamano_bytes)
-            except Exception:
-                tam_legible = "Calculando..."
-
             tareas = []
             if hacer_directo: tareas.append(f"• Sincronización directa ({modo.upper()})")
             if hacer_zip: tareas.append("• Creación de archivo ZIP" + (" cifrado" if cifrar else ""))
 
             tareas_str = "\n".join(tareas)
 
-            msg = f"¿Desea iniciar las siguientes operaciones?\n\n{tareas_str}\n\n• Proyecto: {nombre}\n• Tamaño estimado: {tam_legible}\n• Origen: {origen}\n• Destino: {destino}"
+            # CORRECCIÓN ERROR 2: Se quitó el cálculo pesado de sum() en el hilo UI para evitar que se congele la ventana
+            msg = f"¿Desea iniciar las siguientes operaciones?\n\n{tareas_str}\n\n• Proyecto: {nombre}\n• Origen: {origen}\n• Destino: {destino}"
             if not messagebox.askyesno("Confirmación de Operación", msg):
                 return
 
