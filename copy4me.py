@@ -1,4 +1,5 @@
 from __future__ import annotations
+import subprocess
 import os
 import sys
 import shutil
@@ -48,7 +49,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "4.8 testing zips and buttoms"
+VERSION = "4.8 testing cancel"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -311,20 +312,46 @@ class USBDetector:
 class TaskSchedulerManager:
     """Administra la programación de ejecuciones automáticas en el sistema operativo."""
     @staticmethod
+    def _obtener_comando_ejecucion(perfil_nombre: str) -> str:
+        """Determina la línea de comandos correcta si se ejecuta desde Python o compilado (.exe)."""
+        if getattr(sys, 'frozen', False):
+            # Ejecutable compilado (.exe / binario)
+            exe_path = Path(sys.executable).resolve()
+            return f'"{exe_path}" --run-profile "{perfil_nombre}"'
+        else:
+            # Script .py tradicional
+            python_exe = sys.executable
+            script_path = BASE_DIR / "copy4me.py"
+            return f'"{python_exe}" "{script_path}" --run-profile "{perfil_nombre}"'
+
+    @staticmethod
     def crear_tarea_windows(nombre_tarea: str, perfil_nombre: str, hora_hhmm: str) -> bool:
         if platform.system() != "Windows":
             return False
-        python_exe = sys.executable
-        script_path = BASE_DIR / "copy4me.py"
-        cmd_target = f'"{python_exe}" "{script_path}" --run-profile "{perfil_nombre}"'
-        cmd_schtasks = f'schtasks /create /tn "Copy4Me_{nombre_tarea}" /tr "{cmd_target}" /sc daily /st {hora_hhmm} /f'
-        return os.system(cmd_schtasks) == 0
-
+        
+        cmd_target = TaskSchedulerManager._obtener_comando_ejecucion(perfil_nombre)
+        
+        # Uso seguro con subprocess.run para evitar vulnerabilidades de comando
+        args = [
+            "schtasks", "/create",
+            "/tn", f"Copy4Me_{nombre_tarea}",
+            "/tr", cmd_target,
+            "/sc", "daily",
+            "/st", hora_hhmm,
+            "/f"
+        ]
+        
+        try:
+            res = subprocess.run(args, capture_output=True, text=True, check=True)
+            return res.returncode == 0
+        except Exception as e:
+            logger.error(f"Error creando tarea programada: {e}")
+            return False
     @staticmethod
     def crear_cron_linux(perfil_nombre: str, hora: int, minuto: int) -> str:
-        python_exe = sys.executable
-        script_path = BASE_DIR / "copy4me.py"
-        return f"{minuto} {hora} * * * {python_exe} {script_path} --run-profile \"{perfil_nombre}\" > /dev/null 2>&1"
+        # CORRECCIÓN ERROR 3: Soporte dinámico para ejecutable binario en Linux
+        cmd_target = TaskSchedulerManager._obtener_comando_ejecucion(perfil_nombre)
+        return f"{minuto} {hora} * * * {cmd_target} > /dev/null 2>&1"
 
 # --- Utilidades de Cifrado y Hash Flujo Continuo ---
 class SecurityUtils:
@@ -356,7 +383,7 @@ class SecurityUtils:
         return resultados
 
     @staticmethod
-    def cifrar_archivo(origen: Path, destino: Path, password: str) -> bool:
+    def cifrar_archivo(origen: Path, destino: Path, password: str, cancel_event: Optional[threading.Event] = None) -> bool:
         if not CRYPTO_AVAILABLE:
             raise RuntimeError("La librería PyCryptodome no está instalada.")
         try:
@@ -370,6 +397,9 @@ class SecurityUtils:
                 f_out.write(iv)
                 
                 while True:
+                    if cancel_event and cancel_event.is_set():
+                        raise InterruptedError("Operación cancelada por el usuario")
+                        
                     chunk = f_in.read(CHUNK_SIZE)
                     if len(chunk) == CHUNK_SIZE:
                         f_out.write(cipher.encrypt(chunk))
@@ -481,21 +511,54 @@ class SyncEngine:
                     if src.stat().st_size == dst.stat().st_size and abs(src.stat().st_mtime - dst.stat().st_mtime) <= 2.0:
                         return True, "omitido"
                 
-                shutil.copy2(src, dst)
+                # --- COPIA POR BLOQUES SENSIBLE A LA CANCELACIÓN ---
+                with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
+                    while True:
+                        if self.cancel_event.is_set():
+                            fdst.close()
+                            if dst.exists():
+                                try: dst.unlink()
+                                except Exception: pass
+                            return False, "cancelado"
+                        
+                        chunk = fsrc.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        fdst.write(chunk)
+                
+                # Copiar metadatos (fecha de modificación, etc.)
+                shutil.copystat(src, dst)
+
+                # Verificar Hash si está activado
                 if self.config.get_opcion("verificar_hash", True):
+                    if self.cancel_event.is_set():
+                        return False, "cancelado"
+                        
                     h_src = SecurityUtils.calcular_hash(src)
                     h_dst = SecurityUtils.calcular_hash(dst)
                     if h_src and h_dst and h_src != h_dst:
                         raise ValueError("Incoincidencia de Hash SHA-256")
+
                 return True, "copiado"
+
             except Exception as e:
+                if self.cancel_event.is_set():
+                    if dst.exists():
+                        try: dst.unlink()
+                        except Exception: pass
+                    return False, "cancelado"
+
                 logger.warning(f"Intento {attempt+1}/{max_attempts} fallido para {src.name}: {e}")
                 if dst.exists():
-                    try:
-                        dst.unlink()
-                    except Exception:
-                        pass
-                time.sleep(0.3 * (attempt + 1))
+                    try: dst.unlink()
+                    except Exception: pass
+                
+                # Espera sensible a la cancelación
+                for _ in range(int((0.3 * (attempt + 1)) / 0.05)):
+                    if self.cancel_event.is_set():
+                        return False, "cancelado"
+                    time.sleep(0.05)
+                    
         return False, "error"
 
     def sincronizar(self, origen: Path, destino: Path, modo: str = "espejo",
@@ -558,9 +621,15 @@ class SyncEngine:
                 if callback_log: callback_log("🛑 Proceso de sincronización cancelado.")
                 break
 
+            # Verificación de pausa/cancelación limpia sin bucles infinitos
             while not self.pause_event.is_set():
-                if self.cancel_event.is_set(): break
-                time.sleep(0.2)
+                if self.cancel_event.is_set(): 
+                    break
+                time.sleep(0.1)
+
+            if self.cancel_event.is_set():
+                if callback_log: callback_log("🛑 Proceso de sincronización cancelado.")
+                break
 
             rel = src.relative_to(origen)
             dst = destino / rel
