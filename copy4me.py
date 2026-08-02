@@ -18,8 +18,7 @@ from pathlib import Path
 from typing import Optional, Callable, List, Tuple, Dict, Any
 import tempfile
 import getpass
-
-
+from concurrent.futures import ThreadPoolExecutor
 
 # Activar alta densidad de píxeles (High DPI) en Windows si está disponible
 if platform.system() == "Windows":
@@ -49,7 +48,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "4.5 testing"
+VERSION = "4.7 testing zips"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -95,8 +94,16 @@ def validar_espacio_disponible(origen: Path, destino: Path, tamano_total: Option
         if tamano_total is None:
             tamano_total = calcular_tamano_origen(origen)
             
-        unidad_destino = destino.anchor if destino.exists() else destino.parent.anchor
-        _, _, libre = shutil.disk_usage(unidad_destino)
+        # Corregir la resolución del punto de montaje / unidad
+        dest_abs = destino.resolve()
+        unidad_destino = dest_abs.anchor if dest_abs.anchor else str(dest_abs)
+        
+        # En caso de que la carpeta no exista aún, retrocedemos al ancestro existente
+        target_check = dest_abs
+        while not target_check.exists() and target_check.parent != target_check:
+            target_check = target_check.parent
+
+        _, _, libre = shutil.disk_usage(target_check)
 
         if libre < tamano_total:
             tam_mb = tamano_total / (1024 * 1024)
@@ -150,6 +157,15 @@ def formatear_tamano(tamano_bytes: int) -> str:
             return f"{size:.2f} {unit}"
         size /= 1024.0
     return f"{size:.2f} TB"
+def limpiar_nombre_ruta(nombre: str) -> str:
+    """Elimina caracteres no permitidos en nombres de carpeta/archivo y espacios al final."""
+    if not nombre:
+        return "proyecto_backup"
+    # Reemplazar caracteres problemáticos por guiones bajos
+    nombre_limpio = re.sub(r'[\\/*?:"<>|()]', '_', nombre)
+    # Quitar espacios en blanco al inicio y al final (clave para el Errno 22)
+    nombre_limpio = nombre_limpio.strip()
+    return nombre_limpio if nombre_limpio else "proyecto_backup"
 
 def calcular_tamano_origen(origen: Path) -> int:
     """Calcula el tamaño total en bytes de un archivo o directorio de forma eficiente."""
@@ -291,6 +307,25 @@ class USBDetector:
                 return candidate
         return None
 
+# --- Programador de Tareas Automáticas ---
+class TaskSchedulerManager:
+    """Administra la programación de ejecuciones automáticas en el sistema operativo."""
+    @staticmethod
+    def crear_tarea_windows(nombre_tarea: str, perfil_nombre: str, hora_hhmm: str) -> bool:
+        if platform.system() != "Windows":
+            return False
+        python_exe = sys.executable
+        script_path = BASE_DIR / "copy4me.py"
+        cmd_target = f'"{python_exe}" "{script_path}" --run-profile "{perfil_nombre}"'
+        cmd_schtasks = f'schtasks /create /tn "Copy4Me_{nombre_tarea}" /tr "{cmd_target}" /sc daily /st {hora_hhmm} /f'
+        return os.system(cmd_schtasks) == 0
+
+    @staticmethod
+    def crear_cron_linux(perfil_nombre: str, hora: int, minuto: int) -> str:
+        python_exe = sys.executable
+        script_path = BASE_DIR / "copy4me.py"
+        return f"{minuto} {hora} * * * {python_exe} {script_path} --run-profile \"{perfil_nombre}\" > /dev/null 2>&1"
+
 # --- Utilidades de Cifrado y Hash Flujo Continuo ---
 class SecurityUtils:
     """Proporciona funciones de cálculo de firmas SHA-256 y cifrado por flujo AES-256 CBC."""
@@ -305,6 +340,20 @@ class SecurityUtils:
         except Exception as e:
             logger.warning(f"No se pudo calcular firma hash de {archivo}: {e}")
             return ""
+
+    @staticmethod
+    def calcular_hashes_paralelo(archivos: List[Path], max_workers: int = 4) -> Dict[Path, str]:
+        """Calcula las firmas SHA-256 de forma concurrente para acelerar la comprobación en masa."""
+        resultados = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futuro_a_archivo = {executor.submit(SecurityUtils.calcular_hash, archivo): archivo for archivo in archivos}
+            for futuro in futuro_a_archivo:
+                archivo = futuro_a_archivo[futuro]
+                try:
+                    resultados[archivo] = futuro.result()
+                except Exception:
+                    resultados[archivo] = ""
+        return resultados
 
     @staticmethod
     def cifrar_archivo(origen: Path, destino: Path, password: str) -> bool:
@@ -325,7 +374,6 @@ class SecurityUtils:
                     if len(chunk) == CHUNK_SIZE:
                         f_out.write(cipher.encrypt(chunk))
                     else:
-                        # Último bloque (incluso si mide 0 bytes): aplicamos padding
                         f_out.write(cipher.encrypt(pad(chunk, AES.block_size)))
                         break
             return True
@@ -340,6 +388,7 @@ class SecurityUtils:
 
     @staticmethod
     def descifrar_archivo(origen: Path, destino: Path, password: str) -> bool:
+        """Procesa el stream CBC descifrando y desaplicando padding sin romper bloques."""
         if not CRYPTO_AVAILABLE:
             raise RuntimeError("La librería PyCryptodome no está instalada.")
         try:
@@ -353,16 +402,22 @@ class SecurityUtils:
                 key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
                 cipher = AES.new(key, AES.MODE_CBC, iv)
 
-                prev_chunk = None
+                buffer = b""
                 while True:
                     chunk = f_in.read(CHUNK_SIZE)
                     if not chunk:
-                        if prev_chunk:
-                            f_out.write(unpad(cipher.decrypt(prev_chunk), AES.block_size))
+                        if buffer:
+                            decrypted = cipher.decrypt(buffer)
+                            f_out.write(unpad(decrypted, AES.block_size))
                         break
-                    if prev_chunk:
-                        f_out.write(cipher.decrypt(prev_chunk))
-                    prev_chunk = chunk
+                    
+                    buffer += chunk
+                    if len(buffer) > AES.block_size:
+                        to_decrypt = buffer[:-AES.block_size]
+                        to_decrypt = to_decrypt[:(len(to_decrypt) // AES.block_size) * AES.block_size]
+                        f_out.write(cipher.decrypt(to_decrypt))
+                        buffer = buffer[len(to_decrypt):]
+
             return True
         except Exception as e:
             logger.error(f"Error al descifrar archivo {origen}: {e}")
@@ -373,7 +428,7 @@ class SecurityUtils:
                     pass
             return False
 
-            # --- Motor de Sincronización y Respaldo ---
+# --- Motor de Sincronización y Respaldo ---
 class SyncEngine:
     """Motor central de operaciones de copia, verificación de integridad y compresión."""
     def __init__(self, config: ConfigManager):
@@ -383,6 +438,22 @@ class SyncEngine:
         self.exclude_exts = EXCLUDE_EXTENSIONS.copy()
         for pat in config.get_opcion("excluir_patrones", []):
             self.exclude_exts.add(pat if pat.startswith('.') else f".{pat}")
+            
+        # Controladores de estado en tiempo real
+        self.cancel_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.pause_event.set()
+
+    def detener_operacion(self):
+        """Notifica la cancelación del proceso actual."""
+        self.cancel_event.set()
+
+    def pausar_operacion(self, pausar: bool):
+        """Pausa o reanuda el procesamiento de la copia."""
+        if pausar:
+            self.pause_event.clear()
+        else:
+            self.pause_event.set()
 
     def _excluir_archivo(self, ruta: Path) -> bool:
         if ruta.name.lower() in {d.lower() for d in self.exclude_dirs}:
@@ -401,12 +472,13 @@ class SyncEngine:
 
     def _copiar_con_reintentos(self, src: Path, dst: Path, max_attempts=3, callback_log: Optional[Callable] = None) -> tuple[bool, str]:
         for attempt in range(max_attempts):
+            if self.cancel_event.is_set():
+                return False, "cancelado"
             try:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 if dst.exists():
-                    # Comprobamos si son idénticos para saber si se omite o se actualiza
                     if src.stat().st_size == dst.stat().st_size and abs(src.stat().st_mtime - dst.stat().st_mtime) <= 2.0:
-                        return True, "omitido" # El archivo no cambió
+                        return True, "omitido"
                 
                 shutil.copy2(src, dst)
                 if self.config.get_opcion("verificar_hash", True):
@@ -419,7 +491,7 @@ class SyncEngine:
                 logger.warning(f"Intento {attempt+1}/{max_attempts} fallido para {src.name}: {e}")
                 if dst.exists():
                     try:
-                        dst.unlink()  # <-- Elimina el archivo corrupto en destino antes de reintentar
+                        dst.unlink()
                     except Exception:
                         pass
                 time.sleep(0.3 * (attempt + 1))
@@ -428,6 +500,9 @@ class SyncEngine:
     def sincronizar(self, origen: Path, destino: Path, modo: str = "espejo",
                     callback_progreso: Optional[Callable] = None,
                     callback_log: Optional[Callable] = None) -> Tuple[int, int, int]:
+        self.cancel_event.clear()
+        self.pause_event.set()
+
         if callback_log:
             callback_log(f"🚀 Iniciando sincronización ({modo.upper()})")
             callback_log(f"📂 Origen:  {origen}")
@@ -446,7 +521,6 @@ class SyncEngine:
         for root, dirs, files in os.walk(origen):
             dirs[:] = [d for d in dirs if not self._excluir_archivo(Path(root) / d)]
             
-            # Recopilar carpetas para asegurar que se repliquen aunque estén vacías
             for d in dirs:
                 r_dir = Path(root) / d
                 if not self._excluir_archivo(r_dir):
@@ -459,12 +533,12 @@ class SyncEngine:
 
         carpetas_creadas = 0
 
-        # Crear las carpetas en el destino antes de procesar los archivos e informarlo
         for dir_src in directorios_origen:
+            if self.cancel_event.is_set():
+                break
             rel_dir = dir_src.relative_to(origen)
             dir_dst = destino / rel_dir
             try:
-                # Verificamos si la carpeta NO existe para registrar su creación
                 if not dir_dst.exists():
                     dir_dst.mkdir(parents=True, exist_ok=True)
                     carpetas_creadas += 1
@@ -479,12 +553,19 @@ class SyncEngine:
         copiados, eliminados, errores = 0, 0, 0
 
         for idx, src in enumerate(archivos_origen, 1):
+            if self.cancel_event.is_set():
+                if callback_log: callback_log("🛑 Proceso de sincronización cancelado.")
+                break
+
+            while not self.pause_event.is_set():
+                if self.cancel_event.is_set(): break
+                time.sleep(0.2)
+
             rel = src.relative_to(origen)
             dst = destino / rel
             if callback_progreso:
                 callback_progreso(idx, total, copiados, eliminados, errores, str(rel))
             
-            # Recibimos el estado de la acción
             exito, estado = self._copiar_con_reintentos(src, dst, callback_log=callback_log)
             
             if exito:
@@ -493,12 +574,14 @@ class SyncEngine:
                     if callback_log:
                         callback_log(f"➕ Copiado/Actualizado: {rel}")
             else:
-                errores += 1
-                if callback_log:
-                    callback_log(f"❌ Error al copiar: {rel}")
+                if estado != "cancelado":
+                    errores += 1
+                    if callback_log:
+                        callback_log(f"❌ Error al copiar: {rel}")
 
-        if modo in ("espejo", "bidireccional") and destino.exists():
+        if modo in ("espejo", "bidireccional") and destino.exists() and not self.cancel_event.is_set():
             for root, _, files in os.walk(destino):
+                if self.cancel_event.is_set(): break
                 for f in files:
                     r_dst = Path(root) / f
                     rel = r_dst.relative_to(destino)
@@ -524,14 +607,12 @@ class SyncEngine:
                             else:
                                 errores += 1
 
-            # --- Limpieza de directorios vacíos en modo espejo con REGISTRO DE LOGS ---
-            if modo == "espejo":
+            if modo == "espejo" and not self.cancel_event.is_set():
                 for root, dirs, files in os.walk(destino, topdown=False):
                     for d in dirs:
                         dir_dst = Path(root) / d
                         rel_dir = dir_dst.relative_to(destino)
                         src_dir = origen / rel_dir
-                        # Si la carpeta ya no existe en el origen o está vacía
                         if not src_dir.exists():
                             try:
                                 if not any(dir_dst.iterdir()):
@@ -545,12 +626,11 @@ class SyncEngine:
         if callback_log:
             callback_log(f"✅ Sincronización finalizada. Archivos copiados: {copiados}, Carpetas creadas: {carpetas_creadas}, Eliminados: {eliminados}, Errores: {errores}")
         return copiados, eliminados, errores
+
     def _rotar_backups(self, carpeta: Path, callback_log: Optional[Callable] = None) -> bool:
-        """
-        Rota los backups eliminando los más antiguos cuando se supera el límite max_backups.
-        """
+        """Rota los backups eliminando los más antiguos cuando se supera el límite max_backups."""
         backups = sorted(
-            [f for f in carpeta.rglob("backup_*.zip*") if f.is_file()],
+            [f for f in carpeta.iterdir() if f.is_file() and (f.name.endswith(".zip") or f.name.endswith(".zip.enc"))],
             key=lambda x: x.stat().st_mtime
         )
         
@@ -573,15 +653,19 @@ class SyncEngine:
             if callback_log: callback_log("❌ Error: La carpeta origen no existe.")
             return None
 
-        carpeta_backups = DIR_BACKUPS / nombre_proyecto
+        # --- CORRECCIÓN DE RUTA Y SANITIZACIÓN ---
+        proyecto_sano = limpiar_nombre_ruta(nombre_proyecto)
+        host_sano = limpiar_nombre_ruta(socket.gethostname())
+
+        carpeta_backups = DIR_BACKUPS / proyecto_sano
         carpeta_backups.mkdir(parents=True, exist_ok=True)
         
-        # Rotar archivos antiguos
         self._rotar_backups(carpeta_backups, callback_log)
 
         fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
-        nombre_zip = f"backup_{nombre_proyecto}_{socket.gethostname()}_{fecha}.zip"
+        nombre_zip = f"backup_{proyecto_sano}_{host_sano}_{fecha}.zip"
         ruta_zip = carpeta_backups / nombre_zip
+        # ----------------------------------------
 
         if callback_log:
             callback_log(f"📦 Generando paquete de respaldo completo: {ruta_zip.name}")
@@ -597,24 +681,33 @@ class SyncEngine:
                     "archivos": {}
                 }
                 
+                archivos_a_procesar = []
                 for root, dirs, files in os.walk(carpeta_origen):
                     dirs[:] = [d for d in dirs if not self._excluir_archivo(Path(root) / d)]
                     for f in files:
                         ruta_archivo = Path(root) / f
-                        if self._excluir_archivo(ruta_archivo):
-                            continue
-                            
+                        if not self._excluir_archivo(ruta_archivo):
+                            archivos_a_procesar.append(ruta_archivo)
+
+                hashes_calculados = {}
+                if self.config.get_opcion("verificar_hash", True):
+                    hashes_calculados = SecurityUtils.calcular_hashes_paralelo(archivos_a_procesar)
+
+                for ruta_archivo in archivos_a_procesar:
+                    try:
                         arcname = str(ruta_archivo.relative_to(carpeta_origen))
                         stat = ruta_archivo.stat()
-                        
                         zf.write(ruta_archivo, arcname)
                         manifest["archivos"][arcname] = {
                             "ruta": arcname,
                             "st_size": stat.st_size,
                             "st_mtime": stat.st_mtime,
                             "ubicacion_zip": nombre_zip,
-                            "hash": SecurityUtils.calcular_hash(ruta_archivo) if self.config.get_opcion("verificar_hash", True) else ""
+                            "hash": hashes_calculados.get(ruta_archivo, "")
                         }
+                    except Exception as e_file:
+                        if callback_log: 
+                            callback_log(f"⚠️ Omitido por error de lectura: {ruta_archivo.name} ({e_file})")
 
                 zf.writestr("manifest_backup.json", json.dumps(manifest, indent=4))
 
@@ -631,9 +724,15 @@ class SyncEngine:
             if callback_log:
                 callback_log(f"✅ Backup completo creado exitosamente en: {ruta_zip.name}")
             return ruta_zip
+
         except Exception as e:
             logger.error(f"Error creando backup zip: {e}")
             if callback_log: callback_log(f"❌ Error al crear backup: {e}")
+            if ruta_zip.exists():
+                try:
+                    ruta_zip.unlink()
+                except Exception:
+                    pass
             return None
 
     def restaurar_desde_backup(self, ruta_zip: Path, destino: Path, password: Optional[str] = None,
@@ -668,11 +767,17 @@ class SyncEngine:
 
             with zipfile.ZipFile(target_zip, 'r') as zf:
                 for member in zf.infolist():
-                    if member.filename == "manifest_backup.json":
+                    if member.filename == "manifest_backup.json" or member.is_dir():
                         continue
+                    
                     target_path = (destino_dir / member.filename).resolve()
-                    if str(target_path).startswith(str(destino_dir.resolve())):
-                        zf.extract(member, destino_dir)
+                    
+                    if not str(target_path).startswith(str(destino_dir)):
+                        continue
+                        
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(member) as source, open(target_path, "wb") as target:
+                        shutil.copyfileobj(source, target)
 
             if callback_log:
                 callback_log("✅ Restauración completada con éxito.")
@@ -700,6 +805,7 @@ if GUI_AVAILABLE:
             self.config = ConfigManager()
             self.engine = SyncEngine(self.config)
             self.ui_queue = queue.Queue()
+            self.is_paused = False
 
             self._configurar_estilos()
             self._crear_interfaz()
@@ -711,12 +817,10 @@ if GUI_AVAILABLE:
             self.style = ttk.Style()
             self.style.theme_use('clam')
 
-            # --- PALETA DE COLORES MEJORADA ---
-            COLOR_FONDO_VENTANA = "#f8fafc"   # Blanco/Gris muy claro (Slate 50)
-            COLOR_TARJETAS       = "#ffffff"   # Blanco puro para recuadros
-            COLOR_TEXTO_TITULO  = "#1e293b"   # Azul/Gris muy oscuro para legibilidad
-            COLOR_BOTON_PRIMARIO = "#2563eb"   # Azul moderno (Royal Blue)
-            COLOR_SELECCION      = "#0d9488"   # Teal/Verde azulado para pestaña activa
+            COLOR_FONDO_VENTANA = "#f8fafc"
+            COLOR_TARJETAS       = "#ffffff"
+            COLOR_TEXTO_TITULO  = "#1e293b"
+            COLOR_SELECCION      = "#0d9488"
 
             self.configure(bg=COLOR_FONDO_VENTANA)
 
@@ -725,7 +829,6 @@ if GUI_AVAILABLE:
             self.font_bold = ("Segoe UI", 9, "bold")
             self.font_normal = ("Segoe UI", 9)
 
-            # Configuración del Notebook (Pestañas)
             self.style.configure('TNotebook', background=COLOR_FONDO_VENTANA)
             self.style.configure('TNotebook.Tab', padding=[14, 8], font=("Segoe UI", 10, "bold"))
             self.style.map('TNotebook.Tab',
@@ -733,14 +836,10 @@ if GUI_AVAILABLE:
                 foreground=[('selected', '#ffffff'), ('!selected', '#475569')]
             )
 
-            # Configuración de los Tarjeteros (LabelFrames)
             self.style.configure('TLabelframe', background=COLOR_TARJETAS, relief="solid", borderwidth=1, bordercolor="#cbd5e1")
             self.style.configure('TLabelframe.Label', font=("Segoe UI", 10, "bold"), foreground=COLOR_TEXTO_TITULO, background=COLOR_TARJETAS)
 
-            # Frames generales
             self.style.configure('TFrame', background=COLOR_FONDO_VENTANA)
-
-            # Estilos nativos para widgets TTK si decides migrar
             self.style.configure('TLabel', background=COLOR_TARJETAS, foreground="#334155")
             self.style.configure('TRadiobutton', background=COLOR_TARJETAS, font=("Segoe UI", 9))
             self.style.configure('TCheckbutton', background=COLOR_TARJETAS, font=("Segoe UI", 9))
@@ -763,6 +862,9 @@ if GUI_AVAILABLE:
                         self.progress_bar['value'] = 0
                         self.lbl_progreso.config(text="Estado: En espera")
                         self.lbl_archivo_actual.config(text="")
+                        self.btn_pausa.config(state="disabled", text="⏸️ Pausar")
+                        self.btn_cancelar.config(state="disabled")
+                        self.is_paused = False
                     elif task == "msgbox":
                         messagebox.showinfo(args[0], args[1])
                     elif task == "msgbox_error":
@@ -831,8 +933,17 @@ if GUI_AVAILABLE:
             self.progress_bar = ttk.Progressbar(status_frame, orient="horizontal", mode="determinate")
             self.progress_bar.pack(fill=tk.X, pady=2)
 
-            self.lbl_progreso = ttk.Label(status_frame, text="Estado: En espera", font=self.font_bold)
-            self.lbl_progreso.pack(anchor=tk.W, pady=2)
+            ctrl_row = ttk.Frame(status_frame)
+            ctrl_row.pack(fill=tk.X, pady=2)
+
+            self.lbl_progreso = ttk.Label(ctrl_row, text="Estado: En espera", font=self.font_bold)
+            self.lbl_progreso.pack(side=tk.LEFT)
+
+            self.btn_cancelar = ttk.Button(ctrl_row, text="🛑 Cancelar", command=self._cancelar_tarea, state="disabled")
+            self.btn_cancelar.pack(side=tk.RIGHT, padx=2)
+
+            self.btn_pausa = ttk.Button(ctrl_row, text="⏸️ Pausar", command=self._toggle_pausa, state="disabled")
+            self.btn_pausa.pack(side=tk.RIGHT, padx=2)
 
             self.lbl_archivo_actual = ttk.Label(status_frame, text="", font=self.font_sub)
             self.lbl_archivo_actual.pack(anchor=tk.W)
@@ -842,9 +953,24 @@ if GUI_AVAILABLE:
 
             self.log_text = scrolledtext.ScrolledText(
                 log_frame, height=7, state='disabled',
-                bg='#0f172a', fg='#38bdf8', font=("Consolas", 9)  # Fondo azul noche oscuro con texto azul neón
+                bg='#0f172a', fg='#38bdf8', font=("Consolas", 9)
             )
             self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        def _toggle_pausa(self):
+            if not self.is_paused:
+                self.engine.pausar_operacion(True)
+                self.btn_pausa.config(text="▶️ Reanudar")
+                self.lbl_progreso.config(text="Estado: PAUSADO por el usuario")
+                self.is_paused = True
+            else:
+                self.engine.pausar_operacion(False)
+                self.btn_pausa.config(text="⏸️ Pausar")
+                self.is_paused = False
+
+        def _cancelar_tarea(self):
+            if messagebox.askyesno("Confirmar", "¿Desea detener la operación en curso?"):
+                self.engine.detener_operacion()
 
         def _build_tab_respaldo(self):
             card_origen = ttk.LabelFrame(self.tab_respaldo, text=" 1. Proyecto / Carpeta a respaldar ", padding=10)
@@ -891,7 +1017,6 @@ if GUI_AVAILABLE:
             r3.pack(anchor=tk.W)
             ttk.Label(card_modos, text="   Combina los cambios de ambos lados. Si creaste un archivo en la USB, se copiará de vuelta al PC.", font=self.font_sub).pack(anchor=tk.W, pady=(0, 5))
 
-            # --- NUEVA SECCIÓN DE ACCIONES A EJECUTAR ---
             card_acciones = ttk.LabelFrame(self.tab_respaldo, text=" 4. Tareas a Realizar ", padding=10)
             card_acciones.pack(fill=tk.X, pady=5)
 
@@ -918,23 +1043,19 @@ if GUI_AVAILABLE:
             btn_exec.pack(anchor=tk.E, pady=10)
 
         def _build_tab_restaurar(self):
-            # 1. Selección del proyecto en USB
             card_origen = ttk.LabelFrame(self.tab_restaurar, text=" 1. Proyecto a Recuperar desde USB ", padding=10)
             card_origen.pack(fill=tk.X, pady=5)
 
             row = ttk.Frame(card_origen)
             row.pack(fill=tk.X)
 
-            # Quitamos state="readonly" para permitir ingresar una ruta manualmente
             self.combo_proyectos_restaurar = ttk.Combobox(row, font=self.font_normal) 
             self.combo_proyectos_restaurar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
             self.combo_proyectos_restaurar.bind("<<ComboboxSelected>>", self._on_proyecto_restaurar_selected)
             
-            # Añadimos el botón de búsqueda manual
             ttk.Button(row, text="📁 Buscar Carpeta USB...", command=self._browse_origen_restaurar).pack(side=tk.LEFT, padx=2)
             ttk.Button(row, text="🔍 Escanear Unidades USB", command=self._actualizar_lista_proyectos_usb).pack(side=tk.LEFT)
 
-            # 2. Selección de la carpeta de destino local (PC)
             card_destino = ttk.LabelFrame(self.tab_restaurar, text=" 2. Carpeta Destino en el Ordenador (PC) ", padding=10)
             card_destino.pack(fill=tk.X, pady=10)
 
@@ -944,7 +1065,6 @@ if GUI_AVAILABLE:
             self.entry_destino_restaurar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
             ttk.Button(row2, text="📁 Buscar...", command=self._browse_destino_restaurar).pack(side=tk.LEFT)
 
-            # 3. Origen de restauración (Datos directos vs Copia ZIP)
             card_origen_datos = ttk.LabelFrame(self.tab_restaurar, text=" 3. ¿De dónde quieres restaurar? ", padding=10)
             card_origen_datos.pack(fill=tk.X, pady=5)
 
@@ -970,7 +1090,6 @@ if GUI_AVAILABLE:
             r_zip.pack(anchor=tk.W)
             ttk.Label(card_origen_datos, text="   Descomprime un paquete de copia de seguridad histórico guardado en el USB.", font=self.font_sub).pack(anchor=tk.W, pady=(0, 5))
 
-            # Selector de archivo ZIP (se activa solo si selecciona la opción ZIP)
             self.frame_selector_zip = ttk.Frame(card_origen_datos, padding=(20, 5, 0, 0))
             ttk.Label(self.frame_selector_zip, text="Seleccionar archivo de backup:").pack(side=tk.LEFT, padx=(0, 5))
             self.combo_zips_disponibles = ttk.Combobox(self.frame_selector_zip, state="readonly", width=45)
@@ -979,7 +1098,6 @@ if GUI_AVAILABLE:
             ttk.Button(self.tab_restaurar, text="📥 INICIAR RESTAURACIÓN EN PC", command=self._iniciar_restauracion).pack(anchor=tk.E, pady=15)
 
         def _toggle_origen_restauracion(self):
-            """Muestra u oculta la selección de archivos ZIP según la opción elegida."""
             if self.var_modo_origen_restauracion.get() == "zip":
                 self.frame_selector_zip.pack(fill=tk.X)
             else:
@@ -992,7 +1110,6 @@ if GUI_AVAILABLE:
 
             carpeta_usb = USBDetector.buscar_proyecto_en_usb(nombre)
             if carpeta_usb:
-                # CORRECCIÓN: Buscar los zips dentro de la carpeta del proyecto (carpeta_usb), no en parent
                 zips = sorted([f for f in carpeta_usb.rglob("backup_*.zip*") if f.is_file()], key=lambda x: x.stat().st_mtime, reverse=True)
                 self.combo_zips_disponibles['values'] = [f.name for f in zips]
                 if zips:
@@ -1013,7 +1130,6 @@ if GUI_AVAILABLE:
 
             destino = Path(destino_str)
             
-            # Validar si el texto introducido es una ruta absoluta válida seleccionada manualmente
             if Path(nombre_o_ruta).is_absolute() and Path(nombre_o_ruta).exists():
                 origen_usb = Path(nombre_o_ruta)
             else:
@@ -1025,20 +1141,30 @@ if GUI_AVAILABLE:
                     return
 
                 if messagebox.askyesno("Confirmar", f"Restaurar directamente desde:\n{origen_usb}\nHacia:\n{destino}"):
+                    self.btn_pausa.config(state="normal")
+                    self.btn_cancelar.config(state="normal")
                     threading.Thread(
                         target=self._worker_restauracion_directa, 
                         args=(origen_usb, destino), 
                         daemon=True
                     ).start()
 
-            else: # Modo ZIP
+            else:
                 zip_nombre = self.combo_zips_disponibles.get()
                 if not zip_nombre or "No hay copias" in zip_nombre:
                     messagebox.showerror("Error", "Seleccione un archivo comprimido válido.")
                     return
 
-                # CORRECCIÓN: Apuntar directamente a origen_usb / zip_nombre
-                ruta_zip = origen_usb / zip_nombre if origen_usb else None
+                ruta_zip = None
+                if origen_usb:
+                    candidate = origen_usb / zip_nombre
+                    if candidate.exists():
+                        ruta_zip = candidate
+                    else:
+                        found = list(origen_usb.rglob(zip_nombre))
+                        if found:
+                            ruta_zip = found[0]
+
                 if not ruta_zip or not ruta_zip.exists():
                     messagebox.showerror("Error", f"No se encontró el archivo {zip_nombre} en la unidad USB.")
                     return
@@ -1050,6 +1176,8 @@ if GUI_AVAILABLE:
                         return
 
                 if messagebox.askyesno("Confirmar", f"Descomprimir paquete:\n{zip_nombre}\nHacia:\n{destino}"):
+                    self.btn_pausa.config(state="normal")
+                    self.btn_cancelar.config(state="normal")
                     threading.Thread(
                         target=self._worker_restauracion_backup, 
                         args=(ruta_zip, destino, password), 
@@ -1060,11 +1188,9 @@ if GUI_AVAILABLE:
             self.progress_bar.config(mode="indeterminate")
             self.progress_bar.start(10)
             try:
-                # Notificar visualmente en la barra de estados
                 self.ui_queue.put(("status_text", ("Calculando tamaño de archivos para restaurar...",)))
                 self.log_gui("📊 Verificando tamaño de origen y espacio disponible en la partición del PC...")
                 
-                # --- LLAMADA A LA VALIDACIÓN ---
                 es_valido, mensaje = validar_espacio_disponible(origen, destino)
                 if not es_valido:
                     self.ui_queue.put(("msgbox_error", ("Espacio Insuficiente en PC", f"No se puede restaurar:\n\n{mensaje}")))
@@ -1140,7 +1266,36 @@ if GUI_AVAILABLE:
             self.spin_max_backups.bind("<FocusOut>", lambda e: self.config.set_opcion("max_backups", int(self.spin_max_backups.get())))
             self.spin_max_backups.pack(anchor=tk.W, pady=5)
 
+            card_sched = ttk.LabelFrame(self.tab_config, text=" Programación de Tareas Automáticas ", padding=10)
+            card_sched.pack(fill=tk.X, pady=5)
+
+            ttk.Button(card_sched, text="📅 Programar Tarea Automática", command=self._programar_tarea).pack(anchor=tk.W)
+
             ttk.Button(self.tab_config, text="📋 Inspeccionar Archivo config.json", command=self._ver_config_json).pack(anchor=tk.W, pady=10)
+
+        def _programar_tarea(self):
+            nombre_perfil = self.combo_perfiles.get()
+            if not nombre_perfil:
+                messagebox.showerror("Error", "Seleccione primero un perfil de respaldo en la pestaña principal.")
+                return
+
+            hora_str = simpledialog.askstring("Programar Tarea", "Ingrese la hora en formato HH:MM (ej. 14:30):")
+            if not hora_str:
+                return
+
+            if platform.system() == "Windows":
+                exito = TaskSchedulerManager.crear_tarea_windows(nombre_perfil, nombre_perfil, hora_str)
+                if exito:
+                    messagebox.showinfo("Éxito", f"Tarea programada en Windows Task Scheduler para las {hora_str}.")
+                else:
+                    messagebox.showerror("Error", "No se pudo crear la tarea automatizada.")
+            else:
+                try:
+                    h, m = map(int, hora_str.split(':'))
+                    cron_line = TaskSchedulerManager.crear_cron_linux(nombre_perfil, h, m)
+                    messagebox.showinfo("Instrucción Crontab", f"Copie la siguiente línea en su crontab (crontab -e):\n\n{cron_line}")
+                except Exception:
+                    messagebox.showerror("Error", "Formato de hora inválido.")
 
         def _actualizar_sugerencia_destino(self, nombre_proyecto: str):
             destino_usb = USBDetector.buscar_proyecto_en_usb(nombre_proyecto)
@@ -1164,15 +1319,14 @@ if GUI_AVAILABLE:
                 ultimo_modo = perfil.get("ultimo_modo")
                 if ultimo_modo in ["incremental", "espejo", "bidireccional"]:
                     self.var_modo_respaldo.set(ultimo_modo)
-               
 
         def _browse_origen(self):
             folder = filedialog.askdirectory(title="Selecciona la carpeta raíz a respaldar")
             if folder:
                 folder_path = Path(folder)
                 
-                # --- CAMBIO: Sugerir nombre compuesto y pedir confirmación ---
-                nombre_sugerido = f"{folder_path.name} ({folder_path.parent.name})"
+                # Sanitizamos el nombre sugerido
+                nombre_sugerido = limpiar_nombre_ruta(f"{folder_path.name}_{folder_path.parent.name}")
                 nombre = simpledialog.askstring(
                     "Nombre del Perfil", 
                     "Ingrese un nombre único para este perfil:", 
@@ -1180,14 +1334,14 @@ if GUI_AVAILABLE:
                 )
                 
                 if not nombre:
-                    return # Si el usuario cancela, detenemos el proceso
-                # --- FIN DEL CAMBIO ---
+                    return
                 
-                self.config.set_perfil(nombre, folder_path)
+                nombre_sano = limpiar_nombre_ruta(nombre)
+                self.config.set_perfil(nombre_sano, folder_path)
                 self._refresh_all()
-                self.combo_perfiles.set(nombre)
+                self.combo_perfiles.set(nombre_sano)
                 self.lbl_ruta_origen.config(text=f"Ruta seleccionada: {folder}")
-                self._actualizar_sugerencia_destino(nombre)
+                self._actualizar_sugerencia_destino(nombre_sano)
 
         def _browse_destino_respaldo(self):
             folder = filedialog.askdirectory(title="Selecciona la carpeta de destino para el respaldo")
@@ -1261,7 +1415,9 @@ if GUI_AVAILABLE:
             msg = f"¿Desea iniciar las siguientes operaciones?\n\n{tareas_str}\n\n• Proyecto: {nombre}\n• Tamaño estimado: {tam_legible}\n• Origen: {origen}\n• Destino: {destino}"
             if not messagebox.askyesno("Confirmación de Operación", msg):
                 return
-                
+
+            self.btn_pausa.config(state="normal")
+            self.btn_cancelar.config(state="normal")
             self.progress_bar.stop()
             self.progress_bar.config(mode="indeterminate")
             self.progress_bar.start(10)
@@ -1275,7 +1431,6 @@ if GUI_AVAILABLE:
             ).start()
             
         def _worker_respaldo(self, nombre, origen, destino, modo, password, compression_level, hacer_directo, hacer_zip):
-            # Lista para almacenar el historial de cambios detallados
             cambios_detallados = []
 
             def cb_progreso(idx, total, cop, del_, err, arch):
@@ -1285,14 +1440,12 @@ if GUI_AVAILABLE:
             def cb_log_custom(msg):
                 self.log_gui(msg)
                 self.ui_queue.put(("status_text", (msg,)))
-                # Guardamos los eventos relevantes para el reporte emergente
                 if any(icon in msg for icon in ["➕", "📁", "🗑️", "🔄", "❌"]):
                     cambios_detallados.append(msg)
 
             try:
                 copiados, eliminados, errores = 0, 0, 0
 
-                # 1. EJECUCIÓN DE COPIA / SINCRONIZACIÓN DIRECTA
                 if hacer_directo:
                     cb_log_custom("📊 Verificando espacio disponible para copia directa...")
                     es_valido, mensaje = validar_espacio_disponible(origen, destino)
@@ -1311,8 +1464,7 @@ if GUI_AVAILABLE:
                         metadatos={"ultima_sincronizacion": datetime.now().isoformat(), "ultimo_modo": modo}
                     )
 
-                # 2. EJECUCIÓN DE RESPALDO EN ZIP
-                if hacer_zip:
+                if hacer_zip and not self.engine.cancel_event.is_set():
                     cb_log_custom("📦 Generando paquete comprimido ZIP de respaldo...")
                     
                     if not hacer_directo:
@@ -1325,7 +1477,6 @@ if GUI_AVAILABLE:
                     if not archivo_zip:
                         errores += 1
 
-                # 3. NOTIFICACIÓN CON VENTANA EMERGENTE DETALLADA
                 resumen_header = f"Operación completada en '{nombre}'\n"
                 if hacer_directo:
                     resumen_header += f"• Archivos procesados: {copiados} | Eliminados: {eliminados} | Errores: {errores}\n"
@@ -1337,7 +1488,6 @@ if GUI_AVAILABLE:
                 else:
                     detalle_texto = "No hubo cambios requeridos (los archivos y carpetas ya estaban al día)."
 
-                # Enviar orden de abrir la ventana de reporte detallado
                 self.ui_queue.put(("mostrar_reporte_detallado", (resumen_header, detalle_texto)))
 
             except Exception as e:
@@ -1376,10 +1526,8 @@ if GUI_AVAILABLE:
                 self.ui_queue.put(("status_text", ("Calculando tamaño de archivos a descomprimir...",)))
                 self.log_gui("📊 Verificando tamaño descomprimido y espacio disponible en el PC...")
                 
-                # 1. Calculamos el tamaño real sin comprimir
                 tam_real = calcular_tamano_descomprimido(ruta_zip)
                 
-                # 2. Validamos el espacio pasándole el tamaño exacto
                 es_valido, mensaje = validar_espacio_disponible(ruta_zip, destino, tamano_total=tam_real)
                 if not es_valido:
                     self.ui_queue.put(("msgbox_error", ("Espacio Insuficiente en PC", f"No se puede descomprimir el respaldo:\n\n{mensaje}")))
@@ -1473,32 +1621,28 @@ if GUI_AVAILABLE:
                 self.log_gui("ℹ️ No se detectaron unidades externas al iniciar.")
 
         def _mostrar_ventana_reporte(self, encabezado: str, detalle: str):
-            """Crea una ventana emergente personalizada con barra de desplazamiento para ver todos los cambios."""
             ventana = tk.Toplevel(self)
             ventana.title("Resumen Detallado de Operaciones")
             ventana.geometry("850x600")
             ventana.transient(self)
             ventana.grab_set()
 
-            # Encabezado
             lbl_info = ttk.Label(ventana, text=encabezado, font=self.font_bold, justify=tk.LEFT)
             lbl_info.pack(anchor=tk.W, padx=15, pady=(15, 5))
 
             ttk.Label(ventana, text="Detalle de cambios realizados:", font=self.font_normal).pack(anchor=tk.W, padx=15, pady=(5, 5))
 
-            # Cuadro de texto con desplazamiento para mostrar todos los cambios
             frame_txt = ttk.Frame(ventana, padding=(15, 0, 15, 10))
             frame_txt.pack(fill=tk.BOTH, expand=True)
 
             txt_reporte = scrolledtext.ScrolledText(
                 frame_txt, wrap=tk.WORD, font=("Consolas", 9),
-                bg="#0f172a", fg="#34d399"  # Fondo azul noche con texto verde esmeralda neón
+                bg="#0f172a", fg="#34d399"
             )
             txt_reporte.insert(tk.END, detalle)
             txt_reporte.config(state='disabled')
             txt_reporte.pack(fill=tk.BOTH, expand=True)
 
-            # Botón de cierre
             btn_cerrar = ttk.Button(ventana, text="Entendido / Cerrar", command=ventana.destroy)
             btn_cerrar.pack(pady=10)        
 
@@ -1520,9 +1664,10 @@ def modo_tui():
         print(" 3. 🔍 Administrar Historial de Backups")
         print(" 4. ⚙️ Ver Configuración")
         print(" 5. 🔌 Detectar Dispositivos USB")
-        print(" 6. ❌ Salir")
+        print(" 6. 📅 Programar Tarea Automática")
+        print(" 7. ❌ Salir")
 
-        opcion = input("\nSeleccione una opción [1-6]: ").strip()
+        opcion = input("\nSeleccione una opción [1-7]: ").strip()
         if opcion == "1":
             perfiles = config._data.get("perfiles", {})
             if perfiles:
@@ -1595,11 +1740,19 @@ def modo_tui():
                 hacer_zip = input("¿Desea crear una copia comprimida en ZIP? (s/N): ").strip().lower() == 's'
 
                 if hacer_directo:
-                    engine.sincronizar(origen, destino, modo, callback_log=log_tui)
-                    config.set_perfil(nombre, origen, ruta_destino=destino)
+                    es_valido, mensaje = validar_espacio_disponible(origen, destino)
+                    if not es_valido:
+                        print(f"❌ {mensaje}")
+                    else:
+                        engine.sincronizar(origen, destino, modo, callback_log=log_tui)
+                        config.set_perfil(nombre, origen, ruta_destino=destino)
 
                 if hacer_zip:
-                    engine.crear_backup_zip(origen, nombre, password, config.get_opcion("compresion", 6), log_tui)
+                    es_valido, mensaje = validar_espacio_disponible(origen, DIR_BACKUPS)
+                    if not es_valido:
+                        print(f"❌ {mensaje}")
+                    else:
+                        engine.crear_backup_zip(origen, nombre, password, config.get_opcion("compresion", 6), log_tui)
 
                 input("\nPresione ENTER para continuar...")
 
@@ -1637,7 +1790,7 @@ def modo_tui():
 
             usar_backup = input("¿Restaurar desde paquete ZIP? (s/N): ").strip().lower() == 's'
             if usar_backup:
-                backups = sorted(origen_usb.parent.glob("backup_*.zip*"), key=lambda x: x.stat().st_mtime, reverse=True)
+                backups = sorted(origen_usb.glob("backup_*.zip*"), key=lambda x: x.stat().st_mtime, reverse=True)
                 if not backups:
                     print("❌ No hay archivos ZIP de backup.")
                     input("Presione ENTER...")
@@ -1682,11 +1835,42 @@ def modo_tui():
             input("\nPresione ENTER para continuar...")
 
         elif opcion == "6":
+            nombre_perfil = input("Ingrese el nombre del perfil a programar: ").strip()
+            hora_str = input("Ingrese la hora de ejecución diaria (HH:MM): ").strip()
+            if platform.system() == "Windows":
+                exito = TaskSchedulerManager.crear_tarea_windows(nombre_perfil, nombre_perfil, hora_str)
+                print("✅ Tarea creada correctamente." if exito else "❌ Falló la creación de la tarea.")
+            else:
+                try:
+                    h, m = map(int, hora_str.split(':'))
+                    print("\nComando Crontab generado:")
+                    print(TaskSchedulerManager.crear_cron_linux(nombre_perfil, h, m))
+                except Exception:
+                    print("❌ Formato de hora inválido.")
+            input("\nPresione ENTER para continuar...")
+
+        elif opcion == "7":
             print("👋 Saliendo de Copy4Me. ¡Hasta pronto!")
             sys.exit(0)
 
 # --- Punto de Entrada del Ejecutable ---
 if __name__ == "__main__":
+    if "--run-profile" in sys.argv:
+        try:
+            idx = sys.argv.index("--run-profile")
+            perfil_nombre = sys.argv[idx + 1]
+            cfg = ConfigManager()
+            eng = SyncEngine(cfg)
+            perfil_data = cfg.get_perfil(perfil_nombre)
+            if perfil_data:
+                o = Path(perfil_data["ruta_local"])
+                d = Path(perfil_data["ruta_destino"]) if perfil_data.get("ruta_destino") else DIR_BACKUPS / perfil_nombre / "MASTER"
+                eng.sincronizar(o, d, modo=perfil_data.get("ultimo_modo", "incremental"))
+                eng.crear_backup_zip(o, perfil_nombre)
+        except Exception as e:
+            logger.error(f"Error en ejecución programada de perfil: {e}")
+        sys.exit(0)
+
     if GUI_AVAILABLE:
         try:
             app = Copy4MeGUI()
