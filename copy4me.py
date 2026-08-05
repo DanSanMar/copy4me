@@ -896,7 +896,12 @@ if GUI_AVAILABLE:
                 self.entry_ruta_destino.insert(0, str(cand))
 
         def _browse_origen(self):
-            folder = filedialog.askdirectory(title="Selecciona Carpeta de Origen")
+            # 'parent=self' vincula el diálogo a la ventana principal solucionando
+            # problemas de tamaño reducido o posicionamiento.
+            folder = filedialog.askdirectory(
+                parent=self, 
+                title="Selecciona Carpeta de Origen"
+            )
             if folder:
                 self.entry_ruta_origen.delete(0, tk.END)
                 self.entry_ruta_origen.insert(0, folder)
@@ -906,7 +911,10 @@ if GUI_AVAILABLE:
                 self.combo_perfiles.set(nombre_sano)
 
         def _browse_destino(self):
-            folder = filedialog.askdirectory(title="Selecciona Carpeta de Destino")
+            folder = filedialog.askdirectory(
+                parent=self, 
+                title="Selecciona Carpeta de Destino"
+            )
             if folder:
                 self.entry_ruta_destino.delete(0, tk.END)
                 self.entry_ruta_destino.insert(0, folder)
