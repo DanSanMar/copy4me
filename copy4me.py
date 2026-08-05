@@ -656,8 +656,8 @@ if GUI_AVAILABLE:
         def __init__(self):
             super().__init__()
             self.title(f"{APP_NAME} Split-Screen Engine ({VERSION})")
-            self.geometry("1100x780")
-            self.minsize(980, 680)
+            self.geometry("1280x850")
+            self.minsize(1050, 750)
 
             self.config = ConfigManager()
             self.engine = SyncEngine(self.config)
@@ -673,19 +673,27 @@ if GUI_AVAILABLE:
         def _configurar_estilos(self):
             self.style = ttk.Style()
             self.style.theme_use('clam')
-            self.configure(bg="#f1f5f9")
+            self.configure(bg="#f8fafc")
 
-            self.font_title = ("Segoe UI", 11, "bold")
-            self.font_sub = ("Segoe UI", 8, "italic")
-            self.font_bold = ("Segoe UI", 9, "bold")
-            self.font_big_btn = ("Segoe UI", 10, "bold")
+            # Fuentes más grandes y legibles
+            self.font_title = ("Segoe UI", 12, "bold")
+            self.font_sub = ("Segoe UI", 10, "italic")
+            self.font_bold = ("Segoe UI", 11, "bold")
+            self.font_norm = ("Segoe UI", 11)
+            self.font_big_btn = ("Segoe UI", 11, "bold")
 
+            # Marcos e interfaz general más amplia
             self.style.configure('TLabelframe', background="#ffffff", relief="solid", borderwidth=1, bordercolor="#cbd5e1")
-            self.style.configure('TLabelframe.Label', font=("Segoe UI", 10, "bold"), foreground="#0f172a", background="#ffffff")
-            self.style.configure('TFrame', background="#f1f5f9")
-            self.style.configure('TLabel', background="#ffffff", foreground="#334155")
-            self.style.configure('TRadiobutton', background="#ffffff", font=("Segoe UI", 9))
-            self.style.configure('TCheckbutton', background="#ffffff", font=("Segoe UI", 9))
+            self.style.configure('TLabelframe.Label', font=self.font_title, foreground="#0f172a", background="#ffffff")
+            self.style.configure('TFrame', background="#f8fafc")
+            self.style.configure('TLabel', background="#ffffff", foreground="#334155", font=self.font_norm)
+            self.style.configure('TRadiobutton', background="#ffffff", font=self.font_norm)
+            self.style.configure('TCheckbutton', background="#ffffff", font=self.font_norm)
+            
+            # Altura y padding para botones, selectores y entradas de texto
+            self.style.configure('TButton', font=self.font_norm, padding=6)
+            self.style.configure('TCombobox', font=self.font_norm, padding=4)
+            self.style.configure('TEntry', font=self.font_norm, padding=4)
 
         def _crear_interfaz_dividida(self):
             # Barra Superior Herramientas
@@ -796,8 +804,8 @@ if GUI_AVAILABLE:
             log_frame.pack(fill=tk.BOTH, expand=True)
 
             self.log_text = scrolledtext.ScrolledText(
-                log_frame, height=8, state='disabled',
-                bg='#0f172a', fg='#38bdf8', font=("Consolas", 9)
+                log_frame, height=10, state='disabled',
+                bg='#0f172a', fg='#38bdf8', font=("Consolas", 11)
             )
             self.log_text.pack(fill=tk.BOTH, expand=True)
 
