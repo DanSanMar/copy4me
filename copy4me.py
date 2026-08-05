@@ -728,7 +728,8 @@ if GUI_AVAILABLE:
             row_btn_orig = ttk.Frame(card_origen)
             row_btn_orig.pack(fill=tk.X, pady=3)
             ttk.Button(row_btn_orig, text="📁 Explorar PC...", command=self._browse_origen).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-            ttk.Button(row_btn_orig, text="❌ Borrar Perfil", command=self._eliminar_perfil).pack(side=tk.RIGHT, padx=2)
+            ttk.Button(row_btn_orig, text="✏️ Renombrar", command=self._renombrar_perfil).pack(side=tk.LEFT, padx=2)
+            ttk.Button(row_btn_orig, text="❌ Borrar", command=self._eliminar_perfil).pack(side=tk.RIGHT, padx=2)
 
             ttk.Label(card_origen, text="Ruta de Origen Seleccionada:", font=self.font_bold).pack(anchor=tk.W, pady=(10, 2))
             self.entry_ruta_origen = ttk.Entry(card_origen)
@@ -1138,6 +1139,33 @@ if GUI_AVAILABLE:
             txt.config(state='disabled')
             txt.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 10))
 
+        def _renombrar_perfil(self):
+            nombre_actual = self.combo_perfiles.get()
+            if not nombre_actual:
+                messagebox.showwarning("Atención", "Selecciona primero un perfil para renombrar.")
+                return
+
+            nuevo_nombre = simpledialog.askstring(
+                "Renombrar Perfil", 
+                f"Introduce el nuevo nombre para '{nombre_actual}':",
+                parent=self
+            )
+            
+            if nuevo_nombre:
+                nuevo_nombre_sano = limpiar_nombre_ruta(nuevo_nombre)
+                if nuevo_nombre_sano == nombre_actual:
+                    return
+                
+                # Obtener los datos del perfil actual
+                perfil_data = self.config.get_perfil(nombre_actual)
+                if perfil_data:
+                    # Guardar con el nuevo nombre y eliminar el antiguo
+                    self.config._data["perfiles"][nuevo_nombre_sano] = perfil_data
+                    self.config.delete_perfil(nombre_actual)
+                    self._refresh_all()
+                    self.combo_perfiles.set(nuevo_nombre_sano)
+                    messagebox.showinfo("Éxito", f"Perfil renombrado a '{nuevo_nombre_sano}'.")    
+
 def modo_tui():
     config = ConfigManager()
     engine = SyncEngine(config)
@@ -1260,6 +1288,7 @@ if __name__ == "__main__":
     if GUI_AVAILABLE and os.environ.get('DISPLAY', '') != '' or platform.system() == "Windows":
         try:
             app = Copy4MeGUI()
+            app.tk.call('tk', 'scaling', 2)  # Ajusta el número (1.5, 1.8, 2.0) según el tamaño deseado
             app.mainloop()
         except Exception:
             modo_tui()
