@@ -49,7 +49,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "5.0"
+VERSION = "5.1"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -87,9 +87,22 @@ def get_base_dir() -> Path:
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
-BASE_DIR = get_base_dir()
-DIR_BACKUPS = BASE_DIR / "copy4me_backups"
-CONFIG_FILE = BASE_DIR / "config.json"
+def get_user_app_dir() -> Path:
+    sistema = platform.system()
+    if sistema == "Windows":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sistema == "Darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+
+    app_dir = base / APP_NAME
+    app_dir.mkdir(parents=True, exist_ok=True)
+    return app_dir
+
+CONFIG_DIR = get_user_app_dir()
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DIR_BACKUPS = CONFIG_DIR / "copy4me_backups"
 
 def setup_logging():
     try:
@@ -223,6 +236,7 @@ class USBDetector:
     def listar_unidades_extraibles() -> List[Path]:
         unidades = []
         sistema = platform.system()
+        
         if sistema == "Windows":
             try:
                 import ctypes
@@ -231,18 +245,31 @@ class USBDetector:
                     if bitmask & (1 << i):
                         letter = chr(65 + i) + ":\\"
                         drive_type = ctypes.windll.kernel32.GetDriveTypeW(letter)
-                        if drive_type == 2 or (drive_type == 3 and not letter.startswith("C")):
-                            unidades.append(Path(letter))
+                        # Detectar removibles (2) y discos fijos excepto C:\ (3)
+                        if drive_type in (2, 3) and not letter.startswith("C"):
+                            if Path(letter).exists():
+                                unidades.append(Path(letter))
             except Exception as e:
                 logger.warning(f"Error escaneando unidades en Windows: {e}")
+
         elif sistema == "Linux":
             user = os.getenv("USER") or getpass.getuser()
-            media_paths = [Path(f"/media/{user}"), Path(f"/run/media/{user}"), Path("/mnt")]
+            # Añadidos puntos comunes de montaje adicionales
+            media_paths = [
+                Path(f"/media/{user}"), 
+                Path(f"/run/media/{user}"), 
+                Path("/mnt"), 
+                Path("/media")
+            ]
             for base in media_paths:
                 if base.exists():
-                    for item in base.iterdir():
-                        if item.is_dir() and item.name not in ["cdrom", "floppy"]:
-                            unidades.append(item)
+                    try:
+                        for item in base.iterdir():
+                            if item.is_dir() and item.name not in ["cdrom", "floppy"]:
+                                unidades.append(item)
+                    except PermissionError:
+                        continue
+
         elif sistema == "Darwin":
             volumes = Path("/Volumes")
             if volumes.exists():
@@ -1113,13 +1140,26 @@ if GUI_AVAILABLE:
             self.combo_perfiles['values'] = sorted(perfiles.keys())
 
             proyectos_usb = set()
-            for usb in USBDetector.listar_unidades_extraibles():
+            usbs = USBDetector.listar_unidades_extraibles()
+            
+            for usb in usbs:
+                # Añade la unidad directamente a la lista si no tiene subcarpetas todavía
+                proyectos_usb.add(str(usb)) 
+                
                 backup_dir = usb / "copy4me_backups"
                 if backup_dir.exists():
                     for d in backup_dir.iterdir():
-                        if d.is_dir(): proyectos_usb.add(d.name)
+                        if d.is_dir(): 
+                            proyectos_usb.add(d.name)
 
-            self.combo_proyectos_usb['values'] = sorted(proyectos_usb)
+            self.combo_proyectos_usb['values'] = sorted(list(proyectos_usb))
+            
+            # Si encuentra unidades pero el cuadro destino está vacío, auto-rellena con la primera USB encontrada
+            if usbs and not self.entry_ruta_destino.get().strip():
+                self.entry_ruta_destino.delete(0, tk.END)
+                self.entry_ruta_destino.insert(0, str(usbs[0]))
+                
+            self.log_gui(f"🔄 Escaneo completado. Unidades/Rutas halladas: {len(usbs)}")
 
         def _detectar_usb(self):
             usb = USBDetector.listar_unidades_extraibles()
@@ -1145,26 +1185,35 @@ if GUI_AVAILABLE:
                 messagebox.showwarning("Atención", "Selecciona primero un perfil para renombrar.")
                 return
 
+            # Sincronizar cola gráfica de Tkinter antes de invocar el diálogo
+            self.update_idletasks()
+
+            # Abrir diálogo sin forzar 'parent' estricto para evitar invalidar la ventana X11
             nuevo_nombre = simpledialog.askstring(
                 "Renombrar Perfil", 
-                f"Introduce el nuevo nombre para '{nombre_actual}':",
-                parent=self
+                f"Introduce el nuevo nombre para '{nombre_actual}':"
             )
             
             if nuevo_nombre:
                 nuevo_nombre_sano = limpiar_nombre_ruta(nuevo_nombre)
-                if nuevo_nombre_sano == nombre_actual:
+                if nuevo_nombre_sano == nombre_actual or not nuevo_nombre_sano:
                     return
                 
-                # Obtener los datos del perfil actual
+                # Modificar diccionario de perfiles
                 perfil_data = self.config.get_perfil(nombre_actual)
                 if perfil_data:
-                    # Guardar con el nuevo nombre y eliminar el antiguo
                     self.config._data["perfiles"][nuevo_nombre_sano] = perfil_data
                     self.config.delete_perfil(nombre_actual)
+                    
+                    # Sincronizar eventos pendientes
+                    self.update_idletasks()
+                    
+                    # Refrescar UI
                     self._refresh_all()
                     self.combo_perfiles.set(nuevo_nombre_sano)
-                    messagebox.showinfo("Éxito", f"Perfil renombrado a '{nuevo_nombre_sano}'.")    
+                    
+                    # Registrar el log en consola en lugar de un modal propenso a errores en Wayland
+                    self.log_gui(f"✏️ Perfil '{nombre_actual}' renombrado a '{nuevo_nombre_sano}'")
 
 def modo_tui():
     config = ConfigManager()
@@ -1284,13 +1333,17 @@ def modo_tui():
             break
 
 if __name__ == "__main__":
-    # Si Tkinter está instalado y hay entorno gráfico, arranca GUI; si no, lanza TUI automáticamente
-    if GUI_AVAILABLE and os.environ.get('DISPLAY', '') != '' or platform.system() == "Windows":
+    # Forzar sincronización gráfica para evitar llamadas a ventanas inválidas en Wayland/X11
+    if platform.system() == "Linux":
+        os.environ["TK_SILENT_ERROR"] = "1"
+
+    if GUI_AVAILABLE and (os.environ.get('DISPLAY', '') != '' or os.environ.get('WAYLAND_DISPLAY', '') != '') or platform.system() == "Windows":
         try:
             app = Copy4MeGUI()
-            app.tk.call('tk', 'scaling', 2)  # Ajusta el número (1.5, 1.8, 2.0) según el tamaño deseado
+            app.tk.call('tk', 'scaling', 1.2)  # Ajusta el escalado según tu monitor
             app.mainloop()
-        except Exception:
+        except Exception as e:
+            print(f"Error al iniciar GUI, cambiando a modo TUI: {e}")
             modo_tui()
     else:
         modo_tui()
