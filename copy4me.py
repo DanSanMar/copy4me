@@ -49,7 +49,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "5.2.1"
+VERSION = "5.3"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -1121,51 +1121,140 @@ class Copy4MeGUI(BaseTk):
     def _abrir_ventana_historial(self):
         v = tk.Toplevel(self)
         v.title("Historial de Copias Comprimidas (.ZIP)")
-        v.geometry("700x400")
-        
-        tree = ttk.Treeview(v, columns=("Fecha", "Tamaño", "Formato"), show="tree headings")
+        v.geometry("750x450")
+
+        # Contenedor para la tabla
+        frame_tabla = ttk.Frame(v)
+        frame_tabla.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 5))
+
+        tree = ttk.Treeview(frame_tabla, columns=("Fecha", "Tamaño", "Formato"), show="tree headings")
         tree.heading("#0", text="Proyecto / Archivo Backup")
         tree.heading("Fecha", text="Fecha de Creación")
         tree.heading("Tamaño", text="Tamaño")
         tree.heading("Formato", text="Estado Cifrado")
-        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        if DIR_BACKUPS.exists():
-            for p in sorted(DIR_BACKUPS.iterdir()):
-                if p.is_dir():
-                    node = tree.insert("", tk.END, text=p.name, open=True)
-                    for b in sorted(p.glob("backup_*"), key=lambda x: x.stat().st_mtime, reverse=True):
-                        if b.is_file():
-                            fecha = datetime.fromtimestamp(b.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-                            tam = formatear_tamano(b.stat().st_size)
-                            est = "🔒 Cifrado AES" if b.suffix == ".enc" else "📦 ZIP Estándar"
-                            tree.insert(node, tk.END, text=b.name, values=(fecha, tam, est))
+        # Ajustar anchos de columnas
+        tree.column("#0", width=300)
+        tree.column("Fecha", width=140)
+        tree.column("Tamaño", width=100)
+        tree.column("Formato", width=120)
+
+        scrollbar = ttk.Scrollbar(frame_tabla, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscroll=scrollbar.set)
+        
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Diccionario para mapear nodos del árbol con rutas reales del disco
+        rutas_archivos = {}
+
+        def cargar_backups():
+            tree.delete(*tree.get_children())
+            rutas_archivos.clear()
+
+            if DIR_BACKUPS.exists():
+                for p in sorted(DIR_BACKUPS.iterdir()):
+                    if p.is_dir():
+                        node = tree.insert("", tk.END, text=f"📂 {p.name}", open=True)
+                        for b in sorted(p.glob("backup_*"), key=lambda x: x.stat().st_mtime, reverse=True):
+                            if b.is_file():
+                                fecha = datetime.fromtimestamp(b.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                                tam = formatear_tamano(b.stat().st_size)
+                                est = "🔒 Cifrado AES" if b.suffix == ".enc" else "📦 ZIP Estándar"
+                                item_id = tree.insert(node, tk.END, text=b.name, values=(fecha, tam, est))
+                                rutas_archivos[item_id] = b
+
+        cargar_backups()
+
+        # Botón de eliminación
+        frame_acciones = ttk.Frame(v, padding=5)
+        frame_acciones.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        def borrar_backup_seleccionado():
+            seleccion = tree.selection()
+            if not seleccion:
+                messagebox.showwarning("Atención", "Seleccione un archivo de backup para eliminar.", parent=v)
+                return
+
+            item_id = seleccion[0]
+            ruta_file = rutas_archivos.get(item_id)
+
+            if not ruta_file or not ruta_file.exists():
+                messagebox.showerror("Error", "El elemento seleccionado es una carpeta o el archivo ya no existe.", parent=v)
+                return
+
+            if messagebox.askyesno("Confirmar Borrado", f"¿Desea eliminar permanentemente el archivo?\n\n{ruta_file.name}", parent=v):
+                try:
+                    ruta_file.unlink()
+                    self.log_gui(f"🗑️ Backup eliminado manualmente: {ruta_file.name}")
+                    cargar_backups()
+                except Exception as e:
+                    messagebox.showerror("Error", f"No se pudo eliminar el archivo:\n{e}", parent=v)
+
+        btn_borrar = ttk.Button(frame_acciones, text="🗑️ Eliminar Backup Seleccionado", command=borrar_backup_seleccionado)
+        btn_borrar.pack(side=tk.RIGHT)
 
     def _abrir_ventana_ajustes(self):
         v = tk.Toplevel(self)
         v.title("Ajustes Generales del Sistema")
-        v.geometry("500x380")
+        v.geometry("500x420")
+        v.grab_set()  # Mantiene la ventana al frente hasta que se cierre
 
         f = ttk.Frame(v, padding=15)
         f.pack(fill=tk.BOTH, expand=True)
 
+        # 1. Verificación SHA-256
         var_hash = tk.BooleanVar(value=self.config.get_opcion("verificar_hash", True))
-        ttk.Checkbutton(f, text="Verificación estricta de integridad (SHA-256)", variable=var_hash,
-                        command=lambda: self.config.set_opcion("verificar_hash", var_hash.get())).pack(anchor=tk.W, pady=5)
+        ttk.Checkbutton(f, text="Verificación estricta de integridad (SHA-256)", variable=var_hash).pack(anchor=tk.W, pady=5)
 
-        ttk.Label(f, text="Nivel Compresión ZIP (0-9):").pack(anchor=tk.W, pady=(10, 2))
-        spin_comp = tk.Spinbox(f, from_=0, to=9, width=5)
+        # 2. Rotación de Backups (Máximo de copias)
+        ttk.Label(f, text="Máximo de backups .ZIP a conservar por proyecto:").pack(anchor=tk.W, pady=(10, 2))
+        spin_max = tk.Spinbox(f, from_=1, to=50, width=8)
+        spin_max.delete(0, tk.END)
+        spin_max.insert(0, str(self.config.get_opcion("max_backups", MAX_BACKUPS)))
+        spin_max.pack(anchor=tk.W)
+
+        # 3. Nivel de Compresión
+        ttk.Label(f, text="Nivel Compresión ZIP (0 = sin compresión, 9 = máxima):").pack(anchor=tk.W, pady=(10, 2))
+        spin_comp = tk.Spinbox(f, from_=0, to=9, width=8)
         spin_comp.delete(0, tk.END)
-        spin_comp.insert(0, str(self.config.get_opcion("compresion", 6)))
+        spin_comp.insert(0, str(self.config.get_opcion("compresion", DEFAULT_COMPRESSION_LEVEL)))
         spin_comp.pack(anchor=tk.W)
-        spin_comp.bind("<FocusOut>", lambda e: self.config.set_opcion("compresion", int(spin_comp.get())))
 
-        ttk.Label(f, text="Extensiones Excluidas (sep. por comas):").pack(anchor=tk.W, pady=(10, 2))
+        # 4. Extensiones Excluidas
+        ttk.Label(f, text="Extensiones Excluidas (separadas por comas, ej: .tmp, .log):").pack(anchor=tk.W, pady=(10, 2))
         ent_excl = ttk.Entry(f)
         ent_excl.insert(0, ", ".join(self.config.get_opcion("excluir_patrones", [])))
-        ent_excl.pack(fill=tk.X)
+        ent_excl.pack(fill=tk.X, pady=(0, 15))
 
-        ttk.Button(f, text="Guardar Exclusiones", command=lambda: self.config.set_opcion("excluir_patrones", [x.strip() for x in ent_excl.get().split(',') if x.strip()])).pack(anchor=tk.W, pady=8)
+        # --- FUNCIÓN PARA GUARDAR TODO JUNTO ---
+        def guardar_todos_los_ajustes():
+            try:
+                # Validar y guardar Max Backups
+                max_b = int(spin_max.get())
+                if max_b < 1: max_b = 1
+                self.config.set_opcion("max_backups", max_b)
+                self.engine.max_backups = max_b  # Actualizar motor en caliente
+
+                # Validar y guardar Compresión
+                comp = int(spin_comp.get())
+                if not (0 <= comp <= 9): comp = DEFAULT_COMPRESSION_LEVEL
+                self.config.set_opcion("compresion", comp)
+
+                # Guardar Checkbox y Patrones
+                self.config.set_opcion("verificar_hash", var_hash.get())
+                
+                patrones = [x.strip() for x in ent_excl.get().split(',') if x.strip()]
+                self.config.set_opcion("excluir_patrones", patrones)
+
+                self.log_gui("⚙️ Ajustes guardados correctamente en la configuración.")
+                v.destroy()  # Cerrar ventana
+            except ValueError:
+                messagebox.showerror("Error de Validación", "Por favor ingresa números válidos en los campos numéricos.", parent=v)
+
+        # Botón único de guardado
+        btn_guardar = ttk.Button(f, text="💾 Guardar Cambios", command=guardar_todos_los_ajustes)
+        btn_guardar.pack(anchor=tk.E, pady=10)
 
     def _refresh_all(self):
         perfiles = self.config._data.get("perfiles", {})
