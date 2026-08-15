@@ -49,7 +49,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "5.4"
+VERSION = "5.4.1"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -401,16 +401,25 @@ class SyncEngine:
             self.pause_event.set()
 
     def _excluir_archivo(self, ruta: Path) -> bool:
-        if ruta.name.lower() in {d.lower() for d in self.exclude_dirs} or ruta.name in self.exclude_dirs:
+        # Convertir a minúsculas las carpetas excluidas para comparación agnóstica
+        exclude_dirs_lower = {d.lower() for d in self.exclude_dirs}
+
+        # 1. Comprobar si la ruta o CUALQUIERA de sus carpetas padre está en EXCLUDE_DIRS
+        if any(part.lower() in exclude_dirs_lower for part in ruta.parts):
             return True
+
+        # 2. Comprobar extensiones excluidas
         if ruta.suffix.lower() in self.exclude_exts:
             return True
+
+        # 3. Comprobar expresiones regulares excluidas
         for pat in self.config.get_opcion("excluir_regex", []):
             try:
                 if re.search(pat, str(ruta)):
                     return True
             except re.error:
                 continue
+
         return False
 
     def _copiar_con_reintentos(self, src: Path, dst: Path, max_attempts=3, callback_log: Optional[Callable] = None) -> tuple[bool, str]:
