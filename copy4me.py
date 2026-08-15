@@ -49,7 +49,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "5.3.1"
+VERSION = "5.4"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -474,95 +474,190 @@ class SyncEngine:
         self.cancel_event.clear()
         self.pause_event.set()
 
-        if callback_log:
-            callback_log(f"🚀 Iniciando sincronización ({modo.upper()})")
-            callback_log(f"📂 Origen:  {origen}")
-            callback_log(f"🎯 Destino: {destino}")
-
         origen = Path(origen).resolve()
         destino = Path(destino).resolve()
+
         if destino == origen or origen in destino.parents:
-            if callback_log:
+            if callback_log: 
                 callback_log("❌ Error: La carpeta destino no puede estar dentro de la origen.")
             return 0, 0, 1
-       
+
+        if callback_log:
+            callback_log(f"🚀 Iniciando sincronización ({modo.upper()})")
+            callback_log(f"📂 Carpeta A (PC): {origen}")
+            callback_log(f"🎯 Carpeta B (USB/Destino): {destino}")
+
+        copiados, eliminados, errores = 0, 0, 0
+
+        # =========================================================
+        # MODO BIDIRECCIONAL REAL
+        # =========================================================
+        if modo == "bidireccional":
+            destino.mkdir(parents=True, exist_ok=True)
+            
+            # 1. Recrear estructura de directorios vacíos en ambos lados
+            for root, dirs, _ in os.walk(origen):
+                dirs[:] = [d for d in dirs if not self._excluir_archivo(Path(root) / d)]
+                for d in dirs:
+                    (destino / (Path(root) / d).relative_to(origen)).mkdir(parents=True, exist_ok=True)
+
+            for root, dirs, _ in os.walk(destino):
+                dirs[:] = [d for d in dirs if not self._excluir_archivo(Path(root) / d)]
+                for d in dirs:
+                    (origen / (Path(root) / d).relative_to(destino)).mkdir(parents=True, exist_ok=True)
+
+            # 2. Mapear todos los archivos relativos
+            rel_origen = {p.relative_to(origen): p for p in origen.rglob('*') if p.is_file() and not self._excluir_archivo(p)}
+            rel_destino = {p.relative_to(destino): p for p in destino.rglob('*') if p.is_file() and not self._excluir_archivo(p)}
+
+            todos_los_relativos = sorted(list(set(rel_origen.keys()).union(set(rel_destino.keys()))))
+            total = len(todos_los_relativos)
+
+            for idx, rel in enumerate(todos_los_relativos, 1):
+                if self.cancel_event.is_set(): break
+                while not self.pause_event.is_set():
+                    if self.cancel_event.is_set(): break
+                    time.sleep(0.1)
+
+                src_file = rel_origen.get(rel)
+                dst_file = rel_destino.get(rel)
+
+                target_src = origen / rel
+                target_dst = destino / rel
+
+                if callback_progreso:
+                    callback_progreso(idx, total, copiados, eliminados, errores, str(rel))
+
+                # Caso A: Existe en PC pero NO en USB ➔ Copiar a USB
+                if src_file and not dst_file:
+                    exito, est = self._copiar_con_reintentos(src_file, target_dst, callback_log=callback_log)
+                    if exito and est == "copiado":
+                        copiados += 1
+                        if callback_log: callback_log(f"➕ [PC ➔ USB] Nuevo: {rel}")
+                    elif not exito and est != "cancelado":
+                        errores += 1
+
+                # Caso B: Existe en USB pero NO en PC ➔ Copiar a PC
+                elif dst_file and not src_file:
+                    exito, est = self._copiar_con_reintentos(dst_file, target_src, callback_log=callback_log)
+                    if exito and est == "copiado":
+                        copiados += 1
+                        if callback_log: callback_log(f"🔄 [USB ➔ PC] Nuevo: {rel}")
+                    elif not exito and est != "cancelado":
+                        errores += 1
+
+                # Caso C: Existe en AMBOS LADOS ➔ Comparar fechas
+                elif src_file and dst_file:
+                    try:
+                        mtime_src = src_file.stat().st_mtime
+                        mtime_dst = dst_file.stat().st_mtime
+
+                        if mtime_src - mtime_dst > 2.0:
+                            exito, est = self._copiar_con_reintentos(src_file, target_dst, callback_log=callback_log)
+                            if exito and est == "copiado":
+                                copiados += 1
+                                if callback_log: callback_log(f"⬆️ [PC ➔ USB] Actualizado: {rel}")
+                            elif not exito and est != "cancelado":
+                                errores += 1
+
+                        elif mtime_dst - mtime_src > 2.0:
+                            exito, est = self._copiar_con_reintentos(dst_file, target_src, callback_log=callback_log)
+                            if exito and est == "copiado":
+                                copiados += 1
+                                if callback_log: callback_log(f"⬇️ [USB ➔ PC] Actualizado: {rel}")
+                            elif not exito and est != "cancelado":
+                                errores += 1
+                    except Exception as e:
+                        errores += 1
+
+            if callback_log:
+                callback_log(f"✅ Sincronización Bidireccional completada. Copiados/Actualizados: {copiados}, Errores: {errores}")
+            return copiados, eliminados, errores
+
+        # =========================================================
+        # MODOS INCREMENTAL Y ESPEJO
+        # =========================================================
         archivos_origen = []
         directorios_origen = []
-        
+
         for root, dirs, files in os.walk(origen):
             dirs[:] = [d for d in dirs if not self._excluir_archivo(Path(root) / d)]
             for d in dirs:
                 r_dir = Path(root) / d
                 if not self._excluir_archivo(r_dir):
                     directorios_origen.append(r_dir)
-
             for f in files:
-                r = Path(root) / f
-                if not self._excluir_archivo(r):
-                    archivos_origen.append(r)
+                p = Path(root) / f
+                if not self._excluir_archivo(p):
+                    archivos_origen.append(p)
 
-        carpetas_creadas = 0
+        # Recrear estructura de carpetas de Origen en Destino
         for dir_src in directorios_origen:
             if self.cancel_event.is_set(): break
-            rel_dir = dir_src.relative_to(origen)
-            dir_dst = destino / rel_dir
+            dir_dst = destino / dir_src.relative_to(origen)
             try:
-                if not dir_dst.exists():
-                    dir_dst.mkdir(parents=True, exist_ok=True)
-                    carpetas_creadas += 1
-                else:
-                    dir_dst.mkdir(parents=True, exist_ok=True)
+                dir_dst.mkdir(parents=True, exist_ok=True)
             except Exception as e:
-                logger.warning(f"Error creando carpeta {rel_dir}: {e}")
+                logger.warning(f"Error creando carpeta {dir_dst}: {e}")
 
         total = len(archivos_origen)
-        copiados, eliminados, errores = 0, 0, 0
 
+        # Copiar Archivos
         for idx, src in enumerate(archivos_origen, 1):
-            if self.cancel_event.is_set():
-                if callback_log: callback_log("🛑 Proceso cancelado.")
-                break
-
+            if self.cancel_event.is_set(): break
             while not self.pause_event.is_set():
                 if self.cancel_event.is_set(): break
                 time.sleep(0.1)
 
             rel = src.relative_to(origen)
             dst = destino / rel
+
             if callback_progreso:
                 callback_progreso(idx, total, copiados, eliminados, errores, str(rel))
-            
+
             exito, estado = self._copiar_con_reintentos(src, dst, callback_log=callback_log)
             if exito:
-                if estado == "copiado":
+                if estado == "copiado": 
                     copiados += 1
                     if callback_log: callback_log(f"➕ Copiado: {rel}")
             else:
-                if estado != "cancelado":
+                if estado != "cancelado": 
                     errores += 1
                     if callback_log: callback_log(f"❌ Error al copiar: {rel}")
 
-        if modo in ("espejo", "bidireccional") and destino.exists() and not self.cancel_event.is_set():
-            for root, _, files in os.walk(destino):
+        # Limpieza Estricta en Modo Espejo (Archivos y Carpetas sobrantes)
+        if modo == "espejo" and destino.exists() and not self.cancel_event.is_set():
+            # Usamos topdown=False para procesar las subcarpetas antes que sus padres
+            for root, dirs, files in os.walk(destino, topdown=False):
                 if self.cancel_event.is_set(): break
+                
+                # 1. Eliminar archivos que ya no existen en origen
                 for f in files:
                     r_dst = Path(root) / f
                     rel = r_dst.relative_to(destino)
-                    src_corr = origen / rel
+                    if not (origen / rel).exists():
+                        try:
+                            r_dst.unlink()
+                            eliminados += 1
+                            if callback_log: callback_log(f"🗑️ Eliminado en destino (Espejo): {rel}")
+                        except Exception:
+                            errores += 1
 
-                    if not src_corr.exists():
-                        if modo == "espejo":
-                            try:
-                                r_dst.unlink()
-                                eliminados += 1
-                                if callback_log: callback_log(f"🗑️ Eliminado de destino (Espejo): {rel}")
-                            except Exception:
-                                errores += 1
-                        elif modo == "bidireccional":
-                            exito, estado = self._copiar_con_reintentos(r_dst, src_corr, callback_log=callback_log)
-                            if exito and estado == "copiado":
-                                copiados += 1
-                                if callback_log: callback_log(f"🔄 Recuperado a Origen: {rel}")
+                # 2. Eliminar directorios vacíos o que no existen en origen
+                for d in dirs:
+                    r_dir_dst = Path(root) / d
+                    rel_dir = r_dir_dst.relative_to(destino)
+                    src_dir_corr = origen / rel_dir
+
+                    if not src_dir_corr.exists():
+                        try:
+                            # Intentar eliminar la carpeta (solo funcionará si está vacía)
+                            r_dir_dst.rmdir()
+                            eliminados += 1
+                            if callback_log: callback_log(f"🗑️ Carpeta eliminada en destino (Espejo): {rel_dir}")
+                        except OSError:
+                            # Si no está vacía o hay error de permisos
+                            pass
 
         if callback_log:
             callback_log(f"✅ Finalizado. Copiados: {copiados}, Eliminados: {eliminados}, Errores: {errores}")
