@@ -675,43 +675,66 @@ class SyncEngine:
             return None
 
     def restaurar_desde_backup(self, ruta_zip: Path, destino: Path, password: Optional[str] = None,
-                               callback_log: Optional[Callable] = None) -> bool:
-        if callback_log: callback_log(f"📥 Restaurando paquete: {ruta_zip.name} -> {destino}")
-        temp_zip_file = None
+                               callback_log: Optional[Callable] = None,
+                               callback_progreso: Optional[Callable] = None) -> bool:
+        if callback_log: callback_log(f"📥 Iniciando restauración desde: {ruta_zip.name}")
+        temp_zip_path = None
         target_zip = ruta_zip
 
+        # 1. Gestionar Descifrado AES si aplica
         if ruta_zip.suffix == ".enc":
-            if not CRYPTO_AVAILABLE: return False
+            if not CRYPTO_AVAILABLE:
+                if callback_log: callback_log("❌ Error: Se requiere PyCryptodome para descifrar.")
+                return False
             try:
-                temp_zip_file = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
-                temp_zip_path = Path(temp_zip_file.name)
-                temp_zip_file.close()
+                if callback_log: callback_log("🔑 Descifrando archivo .ZIP.ENC temporalmente...")
+                temp_file = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+                temp_zip_path = Path(temp_file.name)
+                temp_file.close()
+
                 if not SecurityUtils.descifrar_archivo(ruta_zip, temp_zip_path, password):
-                    raise ValueError("Clave incorrecta o backup dañado.")
+                    raise ValueError("Contraseña incorrecta o archivo corrupto.")
                 target_zip = temp_zip_path
             except Exception as e:
-                if callback_log: callback_log(f"❌ Error de descifrado: {e}")
+                if callback_log: callback_log(f"❌ Error al descifrar: {e}")
+                if temp_zip_path and temp_zip_path.exists(): temp_zip_path.unlink()
                 return False
 
+        # 2. Extraer Archivos con Progreso
         try:
             destino_dir = destino.resolve()
             destino_dir.mkdir(parents=True, exist_ok=True)
+
             with zipfile.ZipFile(target_zip, 'r') as zf:
-                for member in zf.infolist():
-                    if member.filename == "manifest_backup.json" or member.is_dir(): continue
+                miembros = [m for m in zf.infolist() if m.filename != "manifest_backup.json" and not m.is_dir()]
+                total = len(miembros)
+
+                for idx, member in enumerate(miembros, 1):
+                    if self.cancel_event.is_set():
+                        if callback_log: callback_log("🛑 Restauración cancelada.")
+                        return False
+
+                    # Prevenir ataques Zip Slip (rutas absolutas maliciosas)
                     target_path = (destino_dir / member.filename).resolve()
-                    if not str(target_path).startswith(str(destino_dir)): continue
+                    if not str(target_path).startswith(str(destino_dir)):
+                        continue
+
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     with zf.open(member) as source, open(target_path, "wb") as target:
                         shutil.copyfileobj(source, target)
-            if callback_log: callback_log("✅ Restauración completada con éxito.")
+
+                    if callback_progreso:
+                        callback_progreso(idx, total, idx, 0, 0, f"Restaurando: {member.filename}")
+
+            if callback_log: callback_log("✅ Restauración desde .ZIP completada con éxito.")
             return True
         except Exception as e:
-            logger.error(f"Error restaurando: {e}")
+            logger.error(f"Error en restauración ZIP: {e}")
+            if callback_log: callback_log(f"❌ Error al restaurar: {e}")
             return False
         finally:
-            if temp_zip_file and Path(temp_zip_file.name).exists():
-                try: Path(temp_zip_file.name).unlink()
+            if temp_zip_path and temp_zip_path.exists():
+                try: temp_zip_path.unlink()
                 except Exception: pass
 
 # --- DISEÑO DIVIDIDO (SPLIT-SCREEN INTERFACE) ---
@@ -1081,39 +1104,105 @@ class Copy4MeGUI(BaseTk):
             self.ui_queue.put(("refresh", None))
 
     def _ejecutar_restauracion_izquierda(self):
-        origen_usb_str = self.entry_ruta_destino.get().strip()
-        destino_pc_str = self.entry_ruta_origen.get().strip()
+        destino_pc = self.entry_ruta_origen.get().strip()
+        origen_usb = self.entry_ruta_destino.get().strip()
 
-        if not origen_usb_str or not Path(origen_usb_str).exists():
-            messagebox.showerror("Error", "Seleccione una carpeta válida en el panel derecho (Destino/USB).")
+        if not destino_pc:
+            messagebox.showerror("Error", "Seleccione la carpeta de la PC (panel izquierdo) donde desea restaurar los datos.")
             return
 
-        if not destino_pc_str:
-            messagebox.showerror("Error", "Seleccione una carpeta de destino válida en el panel izquierdo (PC).")
+        # Ventana de elección de método de restauración
+        win_opc = tk.Toplevel(self)
+        win_opc.title("Seleccionar Método de Restauración")
+        win_opc.geometry("480x240")
+        win_opc.grab_set()
+
+        ttk.Label(win_opc, text="¿Cómo desea realizar la restauración?", font=self.font_bold).pack(pady=12)
+
+        def elegir_zip():
+            win_opc.destroy()
+            self._restaurar_desde_zip_gui(Path(destino_pc))
+
+        def elegir_directo():
+            win_opc.destroy()
+            if not origen_usb or not Path(origen_usb).exists():
+                messagebox.showerror("Error", "Seleccione una carpeta válida en el panel derecho (USB/Destino).")
+                return
+            self._restaurar_directo_gui(Path(origen_usb), Path(destino_pc))
+
+        btn_zip = ttk.Button(win_opc, text="📦 Desde Archivo .ZIP / .ZIP.ENC\n(Elegir una copia comprimida específica)", command=elegir_zip)
+        btn_zip.pack(fill=tk.X, padx=20, pady=8)
+
+        btn_dir = ttk.Button(win_opc, text="📁 Copia Directa entre Carpetas\n(Copiar archivos tal cual desde el panel derecho)", command=elegir_directo)
+        btn_dir.pack(fill=tk.X, padx=20, pady=8)
+
+    def _restaurar_desde_zip_gui(self, destino_pc: Path):
+        # 1. Seleccionar archivo .zip
+        archivo_zip_str = filedialog.askopenfilename(
+            parent=self,
+            title="Selecciona el archivo de Backup (.zip o .zip.enc)",
+            filetypes=[("Archivos de Backup", "*.zip *.zip.enc"), ("Todos los archivos", "*.*")]
+        )
+        if not archivo_zip_str: return
+
+        ruta_zip = Path(archivo_zip_str)
+        password = None
+
+        # 2. Pedir contraseña si es cifrado
+        if ruta_zip.suffix == ".enc":
+            if not CRYPTO_AVAILABLE:
+                messagebox.showerror("Error", "Librería PyCryptodome no instalada.")
+                return
+            password = simpledialog.askstring("Archivo Cifrado", "Introduce la contraseña AES para descifrar:", show='*')
+            if not password: return
+
+        # 3. Confirmar acción
+        if not messagebox.askyesno("Confirmar Restauración", f"¿Restaurar el contenido del paquete:\n{ruta_zip.name}\n\nHacia la carpeta:\n{destino_pc}?"):
             return
 
-        origen_usb = Path(origen_usb_str)
-        destino_pc = Path(destino_pc_str)
+        self.btn_pausa.config(state="normal")
+        self.btn_cancelar.config(state="normal")
+        threading.Thread(target=self._worker_restaurar_zip, args=(ruta_zip, destino_pc, password), daemon=True).start()
 
-        if messagebox.askyesno("Restaurar a PC", f"¿Restaurar datos desde USB a PC?\n\n• Desde: {origen_usb}\n• Hacia: {destino_pc}"):
+    def _worker_restaurar_zip(self, ruta_zip: Path, destino_pc: Path, password: Optional[str]):
+        def cb_progreso(idx, total, cop, del_, err, arch):
+            self.ui_queue.put(("set_determinate", (total,)))
+            self.ui_queue.put(("progress", (idx, total, cop, del_, err, arch)))
+
+        try:
+            exito = self.engine.restaurar_desde_backup(
+                ruta_zip, destino_pc, password, 
+                callback_log=self.log_gui, 
+                callback_progreso=cb_progreso
+            )
+            if exito:
+                self.ui_queue.put(("msgbox", ("Restauración Exitosa", f"Los archivos se restauraron correctamente en:\n{destino_pc}")))
+        except Exception as e:
+            self.ui_queue.put(("msgbox_error", ("Error de Restauración", f"Fallo al restaurar:\n{e}")))
+        finally:
+            self.ui_queue.put(("stop_progress", None))
+            self.ui_queue.put(("refresh", None))
+
+    def _restaurar_directo_gui(self, origen_usb: Path, destino_pc: Path):
+        if messagebox.askyesno("Confirmar Restauración Directa", f"¿Copiar archivos directamente:\nDesde: {origen_usb}\nHacia: {destino_pc}?"):
             self.btn_pausa.config(state="normal")
             self.btn_cancelar.config(state="normal")
-            threading.Thread(target=self._worker_restauracion, args=(origen_usb, destino_pc), daemon=True).start()
+            threading.Thread(target=self._worker_restaurar_directo, args=(origen_usb, destino_pc), daemon=True).start()
 
-    def _worker_restauracion(self, origen, destino):
-        self.progress_bar.config(mode="indeterminate")
-        self.progress_bar.start(10)
+    def _worker_restaurar_directo(self, origen_usb: Path, destino_pc: Path):
+        def cb_progreso(idx, total, cop, del_, err, arch):
+            self.ui_queue.put(("set_determinate", (total,)))
+            self.ui_queue.put(("progress", (idx, total, cop, del_, err, arch)))
+
         try:
-            self.log_gui("📊 Verificando espacio en PC para restauración...")
-            es_valido, mensaje = validar_espacio_disponible(origen, destino)
-            if not es_valido:
-                self.ui_queue.put(("msgbox_error", ("Espacio Insuficiente en PC", mensaje)))
-                return
-
-            copiados, eliminados, errores = self.engine.sincronizar(origen, destino, modo="incremental", callback_log=self.log_gui)
-            self.ui_queue.put(("msgbox", ("Restauración Completada", f"Restauración terminada.\nArchivos copiados: {copiados}\nErrores: {errores}")))
+            copiados, eliminados, errores = self.engine.sincronizar(
+                origen_usb, destino_pc, modo="incremental", 
+                callback_progreso=cb_progreso, 
+                callback_log=self.log_gui
+            )
+            self.ui_queue.put(("msgbox", ("Restauración Completada", f"Sincronización directa terminada.\nArchivos restaurados: {copiados}\nErrores: {errores}")))
         except Exception as e:
-            self.ui_queue.put(("msgbox_error", ("Error", f"Fallo al restaurar: {e}")))
+            self.ui_queue.put(("msgbox_error", ("Error", f"Fallo en la sincronización directa: {e}")))
         finally:
             self.ui_queue.put(("stop_progress", None))
             self.ui_queue.put(("refresh", None))
