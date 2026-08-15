@@ -49,7 +49,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "5.1"
+VERSION = "5.1.1"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -61,6 +61,11 @@ EXCLUDE_EXTENSIONS = {'.tmp', '.log', '.bak'}
 DEFAULT_COMPRESSION_LEVEL = 6
 CHUNK_SIZE = 64 * 1024
 
+CONFIG_DIR = get_user_app_dir()
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DIR_BACKUPS = CONFIG_DIR / "copy4me_backups"
+
+# Validación de espacio disponible
 def validar_espacio_disponible(origen: Path, destino: Path, tamano_total: Optional[int] = None) -> tuple[bool, str]:
     try:
         if tamano_total is None:
@@ -100,9 +105,6 @@ def get_user_app_dir() -> Path:
     app_dir.mkdir(parents=True, exist_ok=True)
     return app_dir
 
-CONFIG_DIR = get_user_app_dir()
-CONFIG_FILE = CONFIG_DIR / "config.json"
-DIR_BACKUPS = CONFIG_DIR / "copy4me_backups"
 
 def setup_logging():
     try:
@@ -137,6 +139,7 @@ def limpiar_nombre_ruta(nombre: str) -> str:
     nombre_limpio = re.sub(r'[\\/*?:"<>|()]', '_', nombre).strip()
     return nombre_limpio if nombre_limpio else "proyecto_backup"
 
+# --- Calcular tamaños ---
 def calcular_tamano_origen(origen: Path) -> int:
     if origen.is_file():
         return origen.stat().st_size
@@ -678,9 +681,12 @@ class SyncEngine:
                 except Exception: pass
 
 # --- NUEVO DISEÑO DIVIDIDO (SPLIT-SCREEN INTERFACE) ---
-if GUI_AVAILABLE:
-    class Copy4MeGUI(tk.Tk):
+BaseTk = tk.Tk if GUI_AVAILABLE else object
+
+class Copy4MeGUI(tk.Tk):
         def __init__(self):
+            if not GUI_AVAILABLE:
+                raise ImportError("Tkinter no está presente en el sistema.")
             super().__init__()
             self.title(f"{APP_NAME} Split-Screen Engine ({VERSION})")
             self.geometry("1280x850")
@@ -1226,124 +1232,247 @@ def modo_tui():
         print("\n" + "="*55)
         print(f"   💻 {APP_NAME} Enterprise - Modo Terminal ({VERSION})")
         print("="*55)
-        print(" 1. ➡️ Sincronizar / Respaldar (Origen -> Destino)")
-        print(" 2. ⬅️ Restaurar Datos (Destino -> Origen)")
-        print(" 3. 📦 Crear Backup .ZIP Comprimido/Cifrado")
-        print(" 4. 📂 Listar y Gestionar Perfiles Guardados")
-        print(" 5. 🔌 Detectar Unidades USB")
+        print(" 1. 🚀 Realizar Sincronización / Respaldo (PC -> USB/Disco)")
+        print(" 2. 📂 Gestionar Perfiles Guardados")
+        print(" 3. 🔌 Escanear y Probar Unidades Externas/USB")
+        print(" 4. 🔄 Restaurar Datos (USB/Disco -> PC)")
+        print(" 5. 📦 Crear Backup .ZIP Comprimido/Cifrado")
         print(" 6. ⚙️ Configuración / Opciones")
-        print(" 0. ❌ Salir")
+        print(" 0. ↩ Salir")
         print("-" * 55)
 
         opc = input("Selecciona una opción [0-6]: ").strip()
 
+        # ==============================================================================
+        # 1. REALIZAR SINCRONIZACIÓN / RESPALDO
+        # ==============================================================================
         if opc == "1":
             print("\n--- RESPALDO DE DATOS ---")
-            origen = input("Ruta Carpeta ORIGEN (PC): ").strip()
-            destino = input("Ruta Carpeta DESTINO (USB/Disco): ").strip()
+            
+            # Gestión de perfiles previos
+            perfiles = config._data.get("perfiles", {})
+            nombre_perfil = ""
+            origen_str = ""
+            destino_str = ""
 
-            if not origen or not Path(origen).exists():
-                print("❌ La ruta origen no existe.")
-                continue
-            if not destino:
-                print("❌ Debe ingresar una ruta destino.")
+            if perfiles:
+                print("\nPerfiles guardados detectados:")
+                keys = list(perfiles.keys())
+                for i, k in enumerate(keys, 1):
+                    print(f"  [{i}] {k} ➔ {perfiles[k].get('ruta_local')}")
+                print("  [0] Ingresar nueva ruta manualmente")
+                
+                sel_p = input("\nSeleccione perfil o 0 para nuevo: ").strip()
+                if sel_p.isdigit() and 1 <= int(sel_p) <= len(keys):
+                    nombre_perfil = keys[int(sel_p) - 1]
+                    p_data = perfiles[nombre_perfil]
+                    origen_str = p_data.get('ruta_local', '')
+                    destino_str = p_data.get('ruta_destino', '')
+
+            # Si no se seleccionó perfil, pedir Origen
+            if not origen_str:
+                origen_str = input("\nRuta Carpeta ORIGEN (PC): ").strip()
+                if not origen_str:
+                    print("❌ Operación cancelada: No se ingresó ruta de origen.")
+                    continue
+                nombre_perfil = Path(origen_str).name
+
+            origen_path = Path(origen_str)
+            if not origen_path.exists():
+                print(f"❌ Error: La ruta de origen '{origen_str}' no existe.")
                 continue
 
-            print("\nModos: [1] Incremental | [2] Espejo | [3] Bidireccional")
-            m_opc = input("Selecciona modo (por defecto 1): ").strip()
+            # Selección/Verificación de Destino
+            if not destino_str:
+                usbs = USBDetector.listar_unidades_extraibles()
+                if usbs:
+                    print("\nUnidades externas detectadas:")
+                    for i, u in enumerate(usbs, 1):
+                        print(f"  [{i}] 🔌 {u}")
+                    print("  [0] Ingresar otra ruta de destino manualmente")
+                    
+                    sel_u = input("\nSeleccione unidad externa o 0: ").strip()
+                    if sel_u.isdigit() and 1 <= int(sel_u) <= len(usbs):
+                        destino_str = str(usbs[int(sel_u) - 1] / "copy4me_backups" / nombre_perfil)
+
+                if not destino_str:
+                    destino_str = input("Ruta Carpeta DESTINO: ").strip()
+
+            if not destino_str:
+                print("❌ Operación cancelada: No se definió una ruta de destino.")
+                continue
+
+            destino_path = Path(destino_str)
+
+            # Selección de Modo
+            print("\nModos de Sincronización:")
+            print("  [1] incremental   | Copia solo archivos nuevos o modificados")
+            print("  [2] espejo        | Borra en destino lo eliminado en origen")
+            print("  [3] bidireccional | Sincroniza cambios en ambos sentidos")
+            m_opc = input("Selecciona modo [1-3] (Por defecto 1): ").strip()
+            
             modo = "espejo" if m_opc == "2" else ("bidireccional" if m_opc == "3" else "incremental")
 
-            is_valid, msg = validar_espacio_disponible(Path(origen), Path(destino))
+            # Validar espacio
+            is_valid, msg = validar_espacio_disponible(origen_path, destino_path)
             if not is_valid:
                 print(f"❌ Error: {msg}")
                 continue
 
-            engine.sincronizar(Path(origen), Path(destino), modo=modo, callback_log=log_tui)
+            # Sincronización y guardado de perfil
+            print("\n🚀 Iniciando proceso...")
+            engine.sincronizar(origen_path, destino_path, modo=modo, callback_log=log_tui)
+            config.set_perfil(nombre_perfil, origen_path, destino_path)
+            print("✔ Perfil actualizado y sincronización finalizada.")
 
-            nombre_p = Path(origen).name
-            config.set_perfil(nombre_p, Path(origen), Path(destino))
-
+        # ==============================================================================
+        # 2. GESTIONAR PERFILES GUARDADOS
+        # ==============================================================================
         elif opc == "2":
-            print("\n--- RESTAURACIÓN DE DATOS ---")
-            origen = input("Ruta Carpeta ORIGEN (Desde USB): ").strip()
-            destino = input("Ruta Carpeta DESTINO (Hacia PC): ").strip()
-
-            if not origen or not Path(origen).exists():
-                print("❌ Ruta de respaldo origen no válida.")
+            print("\n--- GESTIÓN DE PERFILES ---")
+            perfiles = config._data.get("perfiles", {})
+            if not perfiles:
+                print("⚠️ No hay perfiles guardados.")
                 continue
 
-            is_valid, msg = validar_espacio_disponible(Path(origen), Path(destino))
-            if not is_valid:
-                print(f"❌ Error: {msg}")
-                continue
+            keys = list(perfiles.keys())
+            for i, k in enumerate(keys, 1):
+                v = perfiles[k]
+                print(f" [{i}] {k}")
+                print(f"     📁 Origen : {v.get('ruta_local')}")
+                print(f"     🎯 Destino: {v.get('ruta_destino')}")
 
-            engine.sincronizar(Path(origen), Path(destino), modo="incremental", callback_log=log_tui)
+            print("\nOpciones: [D] Eliminar Perfil | [Enter] Volver")
+            sub_opc = input("Acción: ").strip().lower()
 
+            if sub_opc == 'd':
+                num = input("Número de perfil a eliminar: ").strip()
+                if num.isdigit() and 1 <= int(num) <= len(keys):
+                    target = keys[int(num) - 1]
+                    config.delete_perfil(target)
+                    print(f"✔ Perfil '{target}' eliminado con éxito.")
+                else:
+                    print("❌ Selección no válida.")
+
+        # ==============================================================================
+        # 3. ESCANEAR UNIDADES EXTERNAS / USB
+        # ==============================================================================
         elif opc == "3":
-            print("\n--- BACKUP COMPRIMIDO (.ZIP) ---")
-            origen = input("Ruta Carpeta a Comprimir: ").strip()
-            if not origen or not Path(origen).exists():
+            print("\n--- DETECCIÓN DE UNIDADES EXTERNAS / USB ---")
+            usbs = USBDetector.listar_unidades_extraibles()
+            if not usbs:
+                print("⚠️ No se encontraron unidades externas o USBs conectadas.")
+            else:
+                for u in usbs:
+                    print(f"🔌 Unidad detectada: {u}")
+                    backups = u / "copy4me_backups"
+                    if backups.exists():
+                        print(f"   └─ 📂 Proyectos dentro: {[d.name for d in backups.iterdir() if d.is_dir()]}")
+
+        # ==============================================================================
+        # 4. RESTAURAR DATOS (DESTINO -> ORIGEN)
+        # ==============================================================================
+        elif opc == "4":
+            print("\n--- RESTAURACIÓN DE DATOS ---")
+            origen_str = input("Ruta Carpeta ORIGEN (Respaldo en USB/Disco): ").strip()
+            if not origen_str or not Path(origen_str).exists():
+                print("❌ Ruta de origen no válida o inexistente.")
+                continue
+
+            destino_str = input("Ruta Carpeta DESTINO (En PC): ").strip()
+            if not destino_str:
+                print("❌ Debe especificar una ruta de destino.")
+                continue
+
+            is_valid, msg = validar_espacio_disponible(Path(origen_str), Path(destino_str))
+            if not is_valid:
+                print(f"❌ Error de espacio: {msg}")
+                continue
+
+            print("\n🚀 Restaurando archivos...")
+            engine.sincronizar(Path(origen_str), Path(destino_str), modo="incremental", callback_log=log_tui)
+            print("✔ Restauración finalizada.")
+
+        # ==============================================================================
+        # 5. CREAR BACKUP .ZIP COMPRIMIDO / CIFRADO
+        # ==============================================================================
+        elif opc == "5":
+            print("\n--- RESPALDO COMPRIMIDO (.ZIP) ---")
+            origen_str = input("Ruta Carpeta a Comprimir: ").strip()
+            if not origen_str or not Path(origen_str).exists():
                 print("❌ Ruta no válida.")
                 continue
 
-            nombre = input("Nombre del Proyecto: ").strip() or Path(origen).name
+            nombre = input("Nombre del Proyecto: ").strip() or Path(origen_str).name
             cifrar = input("¿Desea cifrar con AES-256? (s/n): ").strip().lower() == 's'
             password = None
 
             if cifrar:
                 if not CRYPTO_AVAILABLE:
-                    print("❌ PyCryptodome no instalada.")
+                    print("❌ PyCryptodome no está instalada en el sistema.")
                     continue
                 password = input("Introduce Contraseña: ").strip()
+                if not password:
+                    print("❌ La contraseña no puede estar vacía.")
+                    continue
 
             comp = config.get_opcion("compresion", 6)
-            engine.crear_backup_zip(Path(origen), nombre, password=password, compression_level=comp, callback_log=log_tui)
+            engine.crear_backup_zip(Path(origen_str), nombre, password=password, compression_level=comp, callback_log=log_tui)
 
-        elif opc == "4":
-            print("\n--- PERFILES CONFIGURADOS ---")
-            perfiles = config._data.get("perfiles", {})
-            if not perfiles:
-                print("No hay perfiles guardados.")
-            else:
-                for k, v in perfiles.items():
-                    print(f"• [{k}] Local: {v.get('ruta_local')} -> Destino: {v.get('ruta_destino')}")
-
-        elif opc == "5":
-            print("\n--- UNIDADES EXTRAÍBLES ---")
-            usbs = USBDetector.listar_unidades_extraibles()
-            if not usbs:
-                print("No se encontraron unidades externas conectadas.")
-            else:
-                for u in usbs:
-                    print(f"🔌 Unidad: {u}")
-
+        # ==============================================================================
+        # 6. CONFIGURACIÓN Y OPICONES
+        # ==============================================================================
         elif opc == "6":
-            print("\n--- CONFIGURACIÓN ---")
+            print("\n--- CONFIGURACIÓN DEL SISTEMA ---")
             hash_val = config.get_opcion("verificar_hash", True)
-            print(f"1. Verificación SHA-256 actual: {hash_val}")
-            print(f"2. Nivel de Compresión actual: {config.get_opcion('compresion', 6)}")
-            
-            sub = input("¿Desea cambiar la verificación SHA-256? (s/n): ").strip().lower()
+            comp_level = config.get_opcion("compresion", 6)
+
+            print(f" 1. Verificación SHA-256 estricta : [{'ACTIVADO' if hash_val else 'DESACTIVADO'}]")
+            print(f" 2. Nivel de compresión ZIP      : [{comp_level}]")
+
+            sub = input("\n¿Desea cambiar la verificación SHA-256? (s/n): ").strip().lower()
             if sub == 's':
                 config.set_opcion("verificar_hash", not hash_val)
-                print(f"Verificación SHA-256 cambiada a: {not hash_val}")
+                print(f"✔ Verificación SHA-256 cambiada a: {not hash_val}")
 
+        # ==============================================================================
+        # 0. SALIR
+        # ==============================================================================
         elif opc == "0":
-            print("👋 Saliendo de Copy4Me...")
+            print("👋 Saliendo de Copy4Me Terminal Engine...")
             break
+        else:
+            print("❌ Opción no válida. Intente nuevamente.")
+
+
+# ==============================================================================
+#           PUNTO DE ENTRADA Y CONTROL DE MODO DE EJECUCIÓN
+# ==============================================================================
 
 if __name__ == "__main__":
-    # Forzar sincronización gráfica para evitar llamadas a ventanas inválidas en Wayland/X11
     if platform.system() == "Linux":
         os.environ["TK_SILENT_ERROR"] = "1"
 
-    if GUI_AVAILABLE and (os.environ.get('DISPLAY', '') != '' or os.environ.get('WAYLAND_DISPLAY', '') != '') or platform.system() == "Windows":
+    tiene_display = (
+        platform.system() == "Windows" or 
+        bool(os.environ.get('DISPLAY', '')) or 
+        bool(os.environ.get('WAYLAND_DISPLAY', ''))
+    )
+
+    if GUI_AVAILABLE and tiene_display:
         try:
             app = Copy4MeGUI()
-            app.tk.call('tk', 'scaling', 1.2)  # Ajusta el escalado según tu monitor
+            app.tk.call('tk', 'scaling', 1.2)
             app.mainloop()
         except Exception as e:
-            print(f"Error al iniciar GUI, cambiando a modo TUI: {e}")
+            print(f"⚠️ No se pudo iniciar la interfaz gráfica ({e}).")
+            print("🔄 Cambiando automáticamente a modo Terminal (TUI)...\n")
             modo_tui()
     else:
+        if not GUI_AVAILABLE:
+            print("ℹ️ Librería gráfica (Tkinter) no detectada.")
+        elif not tiene_display:
+            print("ℹ️ Entorno sin pantalla gráfica detectado (SSH/Servidor).")
+            
+        print("🚀 Iniciando Copy4Me en Modo Terminal (TUI)...\n")
         modo_tui()
