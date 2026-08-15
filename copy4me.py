@@ -49,7 +49,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "5.3"
+VERSION = "5.3.1"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -824,7 +824,14 @@ class Copy4MeGUI(BaseTk):
         card_centro = ttk.Frame(main_split, padding=5)
         card_centro.grid(row=0, column=1, sticky="nsew")
 
-        ttk.Label(card_centro, text="Modo de Operación:", font=self.font_bold).pack(pady=(5, 2))
+        # Fila para Título de Modo + Botón Info
+        row_modo_header = ttk.Frame(card_centro)
+        row_modo_header.pack(pady=(5, 2))
+
+        ttk.Label(row_modo_header, text="Modo de Operación:", font=self.font_bold).pack(side=tk.LEFT)
+        btn_info_modos = ttk.Button(row_modo_header, text="ℹ️", width=3, command=self._mostrar_info_modos)
+        btn_info_modos.pack(side=tk.LEFT, padx=(5, 0))
+
         self.var_modo = tk.StringVar(value="incremental")
         combo_modo = ttk.Combobox(card_centro, textvariable=self.var_modo, values=["incremental", "espejo", "bidireccional"], state="readonly", width=14)
         combo_modo.pack(pady=(0, 10))
@@ -1414,6 +1421,39 @@ class Copy4MeGUI(BaseTk):
                 self._refresh_all()
                 self.combo_perfiles.set(nuevo_nombre_sano)
                 self.log_gui(f"✏️ Perfil '{nombre_actual}' renombrado a '{nuevo_nombre_sano}'")
+
+    def _mostrar_info_modos(self):
+        v = tk.Toplevel(self)
+        v.title("Información sobre Modos de Sincronización")
+        v.geometry("580x450")
+        v.grab_set()
+
+        f = ttk.Frame(v, padding=15)
+        f.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(f, text="📐 Explicación de los Modos de Copiado", font=self.font_bold).pack(anchor=tk.W, pady=(0, 10))
+
+        txt = scrolledtext.ScrolledText(f, wrap=tk.WORD, font=("Segoe UI", 10), bg="#ffffff", fg="#0f172a")
+        txt.pack(fill=tk.BOTH, expand=True)
+
+        contenido = (
+            "1. MODO INCREMENTAL (Añadir sin borrar)\n"
+            "• ¿Qué hace?: Copia de Origen a Destino únicamente los archivos nuevos o que hayan sido modificados recientemente.\n"
+            "• ¿Si borras en PC?: El archivo SE MANTIENE intacto en la USB/Destino.\n"
+            "• Ideal para: Copias acumulativas de seguridad donde no quieres perder nada.\n\n"
+            "--------------------------------------------------\n\n"
+            "2. MODO ESPEJO (Clonación exacta)\n"
+            "• ¿Qué hace?: Fuerza a que el Destino sea un duplicado idéntico del Origen.\n"
+            "• ¿Si borras en PC?: Se BORRARÁ también en la USB/Destino al sincronizar para mantener ambas carpetas iguales.\n"
+            "• Ideal para: Mantener una copia idéntica de trabajo día a día.\n\n"
+            "--------------------------------------------------\n\n"
+            "3. MODO BIDIRECCIONAL (Sincronización en 2 sentidos)\n"
+            "• ¿Qué hace?: Ambas carpetas se actualizan mutuamente. Si creas o modificas un archivo en la USB (por ejemplo, trabajando en otra PC), el programa lo detecta y lo copia de vuelta a tu PC fija.\n"
+            "• Ideal para: Trabajar con la USB en ordenadores portátiles/externos y sincronizar los avances al volver a tu PC."
+        )
+
+        txt.insert(tk.END, contenido)
+        txt.config(state='disabled')
 
 def modo_tui():
     config = ConfigManager()
