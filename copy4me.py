@@ -49,7 +49,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "5.1.1"
+VERSION = "5.2"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -60,6 +60,25 @@ EXCLUDE_DIRS = {
 EXCLUDE_EXTENSIONS = {'.tmp', '.log', '.bak'}
 DEFAULT_COMPRESSION_LEVEL = 6
 CHUNK_SIZE = 64 * 1024
+
+# --- Funciones de Directorio Base ---
+def get_base_dir() -> Path:
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+def get_user_app_dir() -> Path:
+    sistema = platform.system()
+    if sistema == "Windows":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sistema == "Darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+
+    app_dir = base / APP_NAME
+    app_dir.mkdir(parents=True, exist_ok=True)
+    return app_dir
 
 CONFIG_DIR = get_user_app_dir()
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -86,25 +105,6 @@ def validar_espacio_disponible(origen: Path, destino: Path, tamano_total: Option
         return True, "OK"
     except Exception as e:
         return True, f"No se pudo verificar el espacio: {e}"
-
-def get_base_dir() -> Path:
-    if getattr(sys, 'frozen', False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-def get_user_app_dir() -> Path:
-    sistema = platform.system()
-    if sistema == "Windows":
-        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-    elif sistema == "Darwin":
-        base = Path.home() / "Library" / "Application Support"
-    else:
-        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-
-    app_dir = base / APP_NAME
-    app_dir.mkdir(parents=True, exist_ok=True)
-    return app_dir
-
 
 def setup_logging():
     try:
@@ -248,7 +248,6 @@ class USBDetector:
                     if bitmask & (1 << i):
                         letter = chr(65 + i) + ":\\"
                         drive_type = ctypes.windll.kernel32.GetDriveTypeW(letter)
-                        # Detectar removibles (2) y discos fijos excepto C:\ (3)
                         if drive_type in (2, 3) and not letter.startswith("C"):
                             if Path(letter).exists():
                                 unidades.append(Path(letter))
@@ -257,7 +256,6 @@ class USBDetector:
 
         elif sistema == "Linux":
             user = os.getenv("USER") or getpass.getuser()
-            # Añadidos puntos comunes de montaje adicionales
             media_paths = [
                 Path(f"/media/{user}"), 
                 Path(f"/run/media/{user}"), 
@@ -561,7 +559,7 @@ class SyncEngine:
                             except Exception:
                                 errores += 1
                         elif modo == "bidireccional":
-                            exito, estado = self._copiar_con_reintentos(r_dst, src_corr)
+                            exito, estado = self._copiar_con_reintentos(r_dst, src_corr, callback_log=callback_log)
                             if exito and estado == "copiado":
                                 copiados += 1
                                 if callback_log: callback_log(f"🔄 Recuperado a Origen: {rel}")
@@ -680,546 +678,524 @@ class SyncEngine:
                 try: Path(temp_zip_file.name).unlink()
                 except Exception: pass
 
-# --- NUEVO DISEÑO DIVIDIDO (SPLIT-SCREEN INTERFACE) ---
+# --- DISEÑO DIVIDIDO (SPLIT-SCREEN INTERFACE) ---
 BaseTk = tk.Tk if GUI_AVAILABLE else object
 
-class Copy4MeGUI(tk.Tk):
-        def __init__(self):
-            if not GUI_AVAILABLE:
-                raise ImportError("Tkinter no está presente en el sistema.")
-            super().__init__()
-            self.title(f"{APP_NAME} Split-Screen Engine ({VERSION})")
-            self.geometry("1280x850")
-            self.minsize(1050, 750)
+class Copy4MeGUI(BaseTk):
+    def __init__(self):
+        if not GUI_AVAILABLE:
+            raise ImportError("Tkinter no está presente en el sistema.")
+        super().__init__()
+        self.title(f"{APP_NAME} Split-Screen Engine ({VERSION})")
+        self.geometry("1280x850")
+        self.minsize(1050, 750)
 
-            self.config = ConfigManager()
-            self.engine = SyncEngine(self.config)
-            self.ui_queue = queue.Queue()
+        self.config = ConfigManager()
+        self.engine = SyncEngine(self.config)
+        self.ui_queue = queue.Queue()
+        self.is_paused = False
+
+        self._configurar_estilos()
+        self._crear_interfaz_dividida()
+        self._refresh_all()
+        self.after(100, self._procesar_cola)
+        self._detectar_usb()
+
+    def _configurar_estilos(self):
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        self.configure(bg="#f8fafc")
+
+        self.font_title = ("Segoe UI", 12, "bold")
+        self.font_sub = ("Segoe UI", 10, "italic")
+        self.font_bold = ("Segoe UI", 11, "bold")
+        self.font_norm = ("Segoe UI", 11)
+        self.font_big_btn = ("Segoe UI", 11, "bold")
+
+        self.style.configure('TLabelframe', background="#ffffff", relief="solid", borderwidth=1, bordercolor="#cbd5e1")
+        self.style.configure('TLabelframe.Label', font=self.font_title, foreground="#0f172a", background="#ffffff")
+        self.style.configure('TFrame', background="#f8fafc")
+        self.style.configure('TLabel', background="#ffffff", foreground="#334155", font=self.font_norm)
+        self.style.configure('TRadiobutton', background="#ffffff", font=self.font_norm)
+        self.style.configure('TCheckbutton', background="#ffffff", font=self.font_norm)
+        
+        self.style.configure('TButton', font=self.font_norm, padding=6)
+        self.style.configure('TCombobox', font=self.font_norm, padding=4)
+        self.style.configure('TEntry', font=self.font_norm, padding=4)
+
+    def _crear_interfaz_dividida(self):
+        top_bar = ttk.Frame(self, padding=(15, 8))
+        top_bar.pack(fill=tk.X)
+        
+        ttk.Label(top_bar, text=f"📂 {APP_NAME} Enterprise", font=self.font_title, foreground="#0f172a").pack(side=tk.LEFT)
+        
+        btn_tools = ttk.Frame(top_bar)
+        btn_tools.pack(side=tk.RIGHT)
+        
+        ttk.Button(btn_tools, text="🔍 Historial Backups", command=self._abrir_ventana_historial).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_tools, text="⚙️ Ajustes", command=self._abrir_ventana_ajustes).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_tools, text="🔌 Refrescar USB", command=self._refresh_all).pack(side=tk.LEFT, padx=3)
+
+        main_split = ttk.Frame(self, padding=(10, 0, 10, 5))
+        main_split.pack(fill=tk.BOTH, expand=False)
+        main_split.columnconfigure(0, weight=4) 
+        main_split.columnconfigure(1, weight=2) 
+        main_split.columnconfigure(2, weight=4) 
+
+        # ---------------- ORIGEN ----------------
+        card_origen = ttk.LabelFrame(main_split, text=" 💻 CARPETA ORIGEN (PC / LOCAL) ", padding=12)
+        card_origen.grid(row=0, column=0, sticky="nsew", padx=5)
+
+        ttk.Label(card_origen, text="Seleccionar Perfil Guardado o Configurado:").pack(anchor=tk.W)
+        self.combo_perfiles = ttk.Combobox(card_origen, state="readonly")
+        self.combo_perfiles.pack(fill=tk.X, pady=5)
+        self.combo_perfiles.bind("<<ComboboxSelected>>", self._on_perfil_selected)
+
+        row_btn_orig = ttk.Frame(card_origen)
+        row_btn_orig.pack(fill=tk.X, pady=3)
+        ttk.Button(row_btn_orig, text="📁 Explorar PC...", command=self._browse_origen).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(row_btn_orig, text="✏️ Renombrar", command=self._renombrar_perfil).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row_btn_orig, text="❌ Borrar", command=self._eliminar_perfil).pack(side=tk.RIGHT, padx=2)
+
+        ttk.Label(card_origen, text="Ruta de Origen Seleccionada:", font=self.font_bold).pack(anchor=tk.W, pady=(10, 2))
+        self.entry_ruta_origen = ttk.Entry(card_origen)
+        self.entry_ruta_origen.pack(fill=tk.X)
+
+        # ---------------- ACCIÓN ----------------
+        card_centro = ttk.Frame(main_split, padding=5)
+        card_centro.grid(row=0, column=1, sticky="nsew")
+
+        ttk.Label(card_centro, text="Modo de Operación:", font=self.font_bold).pack(pady=(5, 2))
+        self.var_modo = tk.StringVar(value="incremental")
+        combo_modo = ttk.Combobox(card_centro, textvariable=self.var_modo, values=["incremental", "espejo", "bidireccional"], state="readonly", width=14)
+        combo_modo.pack(pady=(0, 10))
+
+        btn_copiar_der = ttk.Button(card_centro, text=" RESPALDAR ➡️\n  (Origen ➔ Destino)", command=self._ejecutar_respaldo_derecha)
+        btn_copiar_der.pack(fill=tk.X, pady=6)
+
+        btn_copiar_izq = ttk.Button(card_centro, text=" ⬅️ RESTAURAR\n  (Destino ➔ Origen)", command=self._ejecutar_restauracion_izquierda)
+        btn_copiar_izq.pack(fill=tk.X, pady=6)
+
+        box_opciones = ttk.LabelFrame(card_centro, text=" Opciones ", padding=5)
+        box_opciones.pack(fill=tk.X, pady=5)
+
+        self.var_hacer_zip = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box_opciones, text="📦 Crear .ZIP", variable=self.var_hacer_zip).pack(anchor=tk.W)
+
+        self.var_cifrar = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box_opciones, text="🔒 Cifrar AES", variable=self.var_cifrar).pack(anchor=tk.W)
+
+        # ---------------- DESTINO ----------------
+        card_destino = ttk.LabelFrame(main_split, text=" 🔌 CARPETA DESTINO (USB / RESPALDO) ", padding=12)
+        card_destino.grid(row=0, column=2, sticky="nsew", padx=5)
+
+        ttk.Label(card_destino, text="Proyectos / Unidades USB Encontradas:").pack(anchor=tk.W)
+        self.combo_proyectos_usb = ttk.Combobox(card_destino)
+        self.combo_proyectos_usb.pack(fill=tk.X, pady=5)
+        self.combo_proyectos_usb.bind("<<ComboboxSelected>>", self._on_destino_selected)
+
+        row_btn_dest = ttk.Frame(card_destino)
+        row_btn_dest.pack(fill=tk.X, pady=3)
+        ttk.Button(row_btn_dest, text="📁 Explorar Destino...", command=self._browse_destino).pack(fill=tk.X, padx=2)
+
+        ttk.Label(card_destino, text="Ruta de Destino Seleccionada:", font=self.font_bold).pack(anchor=tk.W, pady=(10, 2))
+        self.entry_ruta_destino = ttk.Entry(card_destino)
+        self.entry_ruta_destino.pack(fill=tk.X)
+
+        # ---------------- PANEL LOGS/CONTROLES ----------------
+        bottom_panel = ttk.Frame(self, padding=(10, 5))
+        bottom_panel.pack(fill=tk.BOTH, expand=True)
+
+        status_frame = ttk.LabelFrame(bottom_panel, text=" Estado y Progreso de la Operación ", padding=8)
+        status_frame.pack(fill=tk.X, pady=(0, 5))
+
+        self.progress_bar = ttk.Progressbar(status_frame, orient="horizontal", mode="determinate")
+        self.progress_bar.pack(fill=tk.X, pady=2)
+
+        ctrl_row = ttk.Frame(status_frame)
+        ctrl_row.pack(fill=tk.X, pady=2)
+
+        self.lbl_progreso = ttk.Label(ctrl_row, text="Estado: En espera", font=self.font_bold)
+        self.lbl_progreso.pack(side=tk.LEFT)
+
+        self.btn_cancelar = ttk.Button(ctrl_row, text="🛑 Cancelar", command=self._cancelar_tarea, state="disabled")
+        self.btn_cancelar.pack(side=tk.RIGHT, padx=2)
+
+        self.btn_pausa = ttk.Button(ctrl_row, text="⏸️ Pausar", command=self._toggle_pausa, state="disabled")
+        self.btn_pausa.pack(side=tk.RIGHT, padx=2)
+
+        self.lbl_archivo_actual = ttk.Label(status_frame, text="", font=self.font_sub)
+        self.lbl_archivo_actual.pack(anchor=tk.W)
+
+        log_frame = ttk.LabelFrame(bottom_panel, text=" Consola de Registros y Logs en Vivo ", padding=5)
+        log_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame, height=10, state='disabled',
+            bg='#0f172a', fg='#38bdf8', font=("Consolas", 11)
+        )
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def _procesar_cola(self):
+        try:
+            while True:
+                task, args = self.ui_queue.get_nowait()
+                if task == "log":
+                    self._append_log(args[0])
+                elif task == "progress":
+                    self._actualizar_progreso(*args)
+                elif task == "set_determinate":
+                    self.progress_bar.stop()
+                    self.progress_bar.config(mode="determinate", maximum=args[0] if args[0] > 0 else 1)
+                elif task == "status_text":
+                    self.lbl_archivo_actual.config(text=args[0])
+                elif task == "stop_progress":
+                    self.progress_bar.stop()
+                    self.progress_bar['value'] = 0
+                    self.lbl_progreso.config(text="Estado: En espera")
+                    self.lbl_archivo_actual.config(text="")
+                    self.btn_pausa.config(state="disabled", text="⏸️ Pausar")
+                    self.btn_cancelar.config(state="disabled")
+                    self.is_paused = False
+                elif task == "msgbox":
+                    messagebox.showinfo(args[0], args[1])
+                elif task == "msgbox_error":
+                    messagebox.showerror(args[0], args[1])
+                elif task == "refresh":
+                    self._refresh_all()
+                elif task == "mostrar_reporte_detallado":
+                    self._mostrar_ventana_reporte(args[0], args[1])
+                self.ui_queue.task_done()
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._procesar_cola)
+
+    def log_gui(self, texto: str):
+        self.ui_queue.put(("log", (texto,)))
+
+    def _append_log(self, texto: str):
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {texto}\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
+
+    def _actualizar_progreso(self, idx, total, copiados, eliminados, errores, archivo_actual):
+        self.progress_bar['maximum'] = total if total > 0 else 1
+        self.progress_bar['value'] = idx
+        porcentaje = int((idx / total) * 100) if total > 0 else 0
+        self.lbl_progreso.config(
+            text=f"Procesando: {porcentaje}% ({idx}/{total})  |  Copiados: {copiados}  |  Eliminados: {eliminados}  |  Errores: {errores}"
+        )
+        if archivo_actual:
+            self.lbl_archivo_actual.config(text=f"Archivo actual: {archivo_actual}")
+
+    def _toggle_pausa(self):
+        if not self.is_paused:
+            self.engine.pausar_operacion(True)
+            self.btn_pausa.config(text="▶️ Reanudar")
+            self.lbl_progreso.config(text="Estado: PAUSADO por el usuario")
+            self.is_paused = True
+        else:
+            self.engine.pausar_operacion(False)
+            self.btn_pausa.config(text="⏸️ Pausar")
             self.is_paused = False
 
-            self._configurar_estilos()
-            self._crear_interfaz_dividida()
+    def _cancelar_tarea(self):
+        if messagebox.askyesno("Confirmar", "¿Desea detener la operación en curso?"):
+            self.engine.detener_operacion()
+
+    def _on_perfil_selected(self, event):
+        nombre = self.combo_perfiles.get()
+        perfil = self.config.get_perfil(nombre)
+        if perfil:
+            self.entry_ruta_origen.delete(0, tk.END)
+            self.entry_ruta_origen.insert(0, perfil.get('ruta_local', ''))
+            
+            ruta_dest = perfil.get('ruta_destino', '')
+            if not ruta_dest:
+                dest_usb = USBDetector.buscar_proyecto_en_usb(nombre)
+                ruta_dest = str(dest_usb) if dest_usb else str(DIR_BACKUPS / nombre / "MASTER")
+            
+            self.entry_ruta_destino.delete(0, tk.END)
+            self.entry_ruta_destino.insert(0, ruta_dest)
+
+    def _on_destino_selected(self, event):
+        nombre = self.combo_proyectos_usb.get()
+        if not nombre: return
+        cand = USBDetector.buscar_proyecto_en_usb(nombre)
+        if cand:
+            self.entry_ruta_destino.delete(0, tk.END)
+            self.entry_ruta_destino.insert(0, str(cand))
+
+    def _browse_origen(self):
+        folder = filedialog.askdirectory(
+            parent=self, 
+            title="Selecciona Carpeta de Origen"
+        )
+        if folder:
+            self.entry_ruta_origen.delete(0, tk.END)
+            self.entry_ruta_origen.insert(0, folder)
+            nombre_sano = limpiar_nombre_ruta(Path(folder).name)
+            self.config.set_perfil(nombre_sano, Path(folder))
             self._refresh_all()
-            self.after(100, self._procesar_cola)
-            self._detectar_usb()
+            self.combo_perfiles.set(nombre_sano)
 
-        def _configurar_estilos(self):
-            self.style = ttk.Style()
-            self.style.theme_use('clam')
-            self.configure(bg="#f8fafc")
+    def _browse_destino(self):
+        folder = filedialog.askdirectory(
+            parent=self, 
+            title="Selecciona Carpeta de Destino"
+        )
+        if folder:
+            self.entry_ruta_destino.delete(0, tk.END)
+            self.entry_ruta_destino.insert(0, folder)
 
-            # Fuentes más grandes y legibles
-            self.font_title = ("Segoe UI", 12, "bold")
-            self.font_sub = ("Segoe UI", 10, "italic")
-            self.font_bold = ("Segoe UI", 11, "bold")
-            self.font_norm = ("Segoe UI", 11)
-            self.font_big_btn = ("Segoe UI", 11, "bold")
+    def _eliminar_perfil(self):
+        nombre = self.combo_perfiles.get()
+        if nombre and messagebox.askyesno("Borrar Perfil", f"¿Eliminar el perfil '{nombre}'?"):
+            self.config.delete_perfil(nombre)
+            self._refresh_all()
 
-            # Marcos e interfaz general más amplia
-            self.style.configure('TLabelframe', background="#ffffff", relief="solid", borderwidth=1, bordercolor="#cbd5e1")
-            self.style.configure('TLabelframe.Label', font=self.font_title, foreground="#0f172a", background="#ffffff")
-            self.style.configure('TFrame', background="#f8fafc")
-            self.style.configure('TLabel', background="#ffffff", foreground="#334155", font=self.font_norm)
-            self.style.configure('TRadiobutton', background="#ffffff", font=self.font_norm)
-            self.style.configure('TCheckbutton', background="#ffffff", font=self.font_norm)
-            
-            # Altura y padding para botones, selectores y entradas de texto
-            self.style.configure('TButton', font=self.font_norm, padding=6)
-            self.style.configure('TCombobox', font=self.font_norm, padding=4)
-            self.style.configure('TEntry', font=self.font_norm, padding=4)
+    def _ejecutar_respaldo_derecha(self):
+        origen_str = self.entry_ruta_origen.get().strip()
+        destino_str = self.entry_ruta_destino.get().strip()
 
-        def _crear_interfaz_dividida(self):
-            # Barra Superior Herramientas
-            top_bar = ttk.Frame(self, padding=(15, 8))
-            top_bar.pack(fill=tk.X)
-            
-            ttk.Label(top_bar, text=f"📂 {APP_NAME} Enterprise", font=self.font_title, foreground="#0f172a").pack(side=tk.LEFT)
-            
-            btn_tools = ttk.Frame(top_bar)
-            btn_tools.pack(side=tk.RIGHT)
-            
-            ttk.Button(btn_tools, text="🔍 Historial Backups", command=self._abrir_ventana_historial).pack(side=tk.LEFT, padx=3)
-            ttk.Button(btn_tools, text="⚙️ Ajustes", command=self._abrir_ventana_ajustes).pack(side=tk.LEFT, padx=3)
-            ttk.Button(btn_tools, text="🔌 Refrescar USB", command=self._refresh_all).pack(side=tk.LEFT, padx=3)
+        if not origen_str or not Path(origen_str).exists():
+            messagebox.showerror("Error", "Seleccione una carpeta de origen válida en el panel izquierdo.")
+            return
 
-            # --- PANEL DIVIDIDO PRINCIPAL ---
-            main_split = ttk.Frame(self, padding=(10, 0, 10, 5))
-            main_split.pack(fill=tk.BOTH, expand=False)
-            main_split.columnconfigure(0, weight=4) # Lado Origen
-            main_split.columnconfigure(1, weight=2) # Centro (Botones Flechas)
-            main_split.columnconfigure(2, weight=4) # Lado Destino
+        if not destino_str:
+            messagebox.showerror("Error", "Seleccione una carpeta de destino en el panel derecho.")
+            return
 
-            # ---------------- LADO IZQUIERDO: ORIGEN (PC) ----------------
-            card_origen = ttk.LabelFrame(main_split, text=" 💻 CARPETA ORIGEN (PC / LOCAL) ", padding=12)
-            card_origen.grid(row=0, column=0, sticky="nsew", padx=5)
+        origen = Path(origen_str)
+        destino = Path(destino_str)
+        nombre = self.combo_perfiles.get() or origen.name
 
-            ttk.Label(card_origen, text="Seleccionar Perfil Guardado o Configurado:").pack(anchor=tk.W)
-            self.combo_perfiles = ttk.Combobox(card_origen, state="readonly")
-            self.combo_perfiles.pack(fill=tk.X, pady=5)
-            self.combo_perfiles.bind("<<ComboboxSelected>>", self._on_perfil_selected)
+        modo = self.var_modo.get()
+        hacer_zip = self.var_hacer_zip.get()
+        cifrar = self.var_cifrar.get()
+        password = None
 
-            row_btn_orig = ttk.Frame(card_origen)
-            row_btn_orig.pack(fill=tk.X, pady=3)
-            ttk.Button(row_btn_orig, text="📁 Explorar PC...", command=self._browse_origen).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-            ttk.Button(row_btn_orig, text="✏️ Renombrar", command=self._renombrar_perfil).pack(side=tk.LEFT, padx=2)
-            ttk.Button(row_btn_orig, text="❌ Borrar", command=self._eliminar_perfil).pack(side=tk.RIGHT, padx=2)
-
-            ttk.Label(card_origen, text="Ruta de Origen Seleccionada:", font=self.font_bold).pack(anchor=tk.W, pady=(10, 2))
-            self.entry_ruta_origen = ttk.Entry(card_origen)
-            self.entry_ruta_origen.pack(fill=tk.X)
-
-            # ---------------- CENTRO: BOTONES ACCIÓN CON FLECHAS ----------------
-            card_centro = ttk.Frame(main_split, padding=5)
-            card_centro.grid(row=0, column=1, sticky="nsew")
-
-            ttk.Label(card_centro, text="Modo de Operación:", font=self.font_bold).pack(pady=(5, 2))
-            self.var_modo = tk.StringVar(value="incremental")
-            combo_modo = ttk.Combobox(card_centro, textvariable=self.var_modo, values=["incremental", "espejo", "bidireccional"], state="readonly", width=14)
-            combo_modo.pack(pady=(0, 10))
-
-            btn_copiar_der = ttk.Button(card_centro, text=" RESPALDAR ➡️\n  (Origen ➔ Destino)", command=self._ejecutar_respaldo_derecha)
-            btn_copiar_der.pack(fill=tk.X, pady=6)
-
-            btn_copiar_izq = ttk.Button(card_centro, text=" ⬅️ RESTAURAR\n  (Destino ➔ Origen)", command=self._ejecutar_restauracion_izquierda)
-            btn_copiar_izq.pack(fill=tk.X, pady=6)
-
-            box_opciones = ttk.LabelFrame(card_centro, text=" Opciones ", padding=5)
-            box_opciones.pack(fill=tk.X, pady=5)
-
-            self.var_hacer_zip = tk.BooleanVar(value=False)
-            ttk.Checkbutton(box_opciones, text="📦 Crear .ZIP", variable=self.var_hacer_zip).pack(anchor=tk.W)
-
-            self.var_cifrar = tk.BooleanVar(value=False)
-            ttk.Checkbutton(box_opciones, text="🔒 Cifrar AES", variable=self.var_cifrar).pack(anchor=tk.W)
-
-            # ---------------- LADO DERECHO: DESTINO (USB / PC) ----------------
-            card_destino = ttk.LabelFrame(main_split, text=" 🔌 CARPETA DESTINO (USB / RESPALDO) ", padding=12)
-            card_destino.grid(row=0, column=2, sticky="nsew", padx=5)
-
-            ttk.Label(card_destino, text="Proyectos / Unidades USB Encontradas:").pack(anchor=tk.W)
-            self.combo_proyectos_usb = ttk.Combobox(card_destino)
-            self.combo_proyectos_usb.pack(fill=tk.X, pady=5)
-            self.combo_proyectos_usb.bind("<<ComboboxSelected>>", self._on_destino_selected)
-
-            row_btn_dest = ttk.Frame(card_destino)
-            row_btn_dest.pack(fill=tk.X, pady=3)
-            ttk.Button(row_btn_dest, text="📁 Explorar Destino...", command=self._browse_destino).pack(fill=tk.X, padx=2)
-
-            ttk.Label(card_destino, text="Ruta de Destino Seleccionada:", font=self.font_bold).pack(anchor=tk.W, pady=(10, 2))
-            self.entry_ruta_destino = ttk.Entry(card_destino)
-            self.entry_ruta_destino.pack(fill=tk.X)
-
-            # ---------------- ZONA INFERIOR: LOGS Y CONTROLES ----------------
-            bottom_panel = ttk.Frame(self, padding=(10, 5))
-            bottom_panel.pack(fill=tk.BOTH, expand=True)
-
-            status_frame = ttk.LabelFrame(bottom_panel, text=" Estado y Progreso de la Operación ", padding=8)
-            status_frame.pack(fill=tk.X, pady=(0, 5))
-
-            self.progress_bar = ttk.Progressbar(status_frame, orient="horizontal", mode="determinate")
-            self.progress_bar.pack(fill=tk.X, pady=2)
-
-            ctrl_row = ttk.Frame(status_frame)
-            ctrl_row.pack(fill=tk.X, pady=2)
-
-            self.lbl_progreso = ttk.Label(ctrl_row, text="Estado: En espera", font=self.font_bold)
-            self.lbl_progreso.pack(side=tk.LEFT)
-
-            self.btn_cancelar = ttk.Button(ctrl_row, text="🛑 Cancelar", command=self._cancelar_tarea, state="disabled")
-            self.btn_cancelar.pack(side=tk.RIGHT, padx=2)
-
-            self.btn_pausa = ttk.Button(ctrl_row, text="⏸️ Pausar", command=self._toggle_pausa, state="disabled")
-            self.btn_pausa.pack(side=tk.RIGHT, padx=2)
-
-            self.lbl_archivo_actual = ttk.Label(status_frame, text="", font=self.font_sub)
-            self.lbl_archivo_actual.pack(anchor=tk.W)
-
-            log_frame = ttk.LabelFrame(bottom_panel, text=" Consola de Registros y Logs en Vivo ", padding=5)
-            log_frame.pack(fill=tk.BOTH, expand=True)
-
-            self.log_text = scrolledtext.ScrolledText(
-                log_frame, height=10, state='disabled',
-                bg='#0f172a', fg='#38bdf8', font=("Consolas", 11)
-            )
-            self.log_text.pack(fill=tk.BOTH, expand=True)
-
-        # --- Manejo de la Cola de Interfaz ---
-        def _procesar_cola(self):
-            try:
-                while True:
-                    task, args = self.ui_queue.get_nowait()
-                    if task == "log":
-                        self._append_log(args[0])
-                    elif task == "progress":
-                        self._actualizar_progreso(*args)
-                    elif task == "set_determinate":
-                        self.progress_bar.stop()
-                        self.progress_bar.config(mode="determinate", maximum=args[0] if args[0] > 0 else 1)
-                    elif task == "status_text":
-                        self.lbl_archivo_actual.config(text=args[0])
-                    elif task == "stop_progress":
-                        self.progress_bar.stop()
-                        self.progress_bar['value'] = 0
-                        self.lbl_progreso.config(text="Estado: En espera")
-                        self.lbl_archivo_actual.config(text="")
-                        self.btn_pausa.config(state="disabled", text="⏸️ Pausar")
-                        self.btn_cancelar.config(state="disabled")
-                        self.is_paused = False
-                    elif task == "msgbox":
-                        messagebox.showinfo(args[0], args[1])
-                    elif task == "msgbox_error":
-                        messagebox.showerror(args[0], args[1])
-                    elif task == "refresh":
-                        self._refresh_all()
-                    elif task == "mostrar_reporte_detallado":
-                        self._mostrar_ventana_reporte(args[0], args[1])
-                    self.ui_queue.task_done()
-            except queue.Empty:
-                pass
-            finally:
-                self.after(100, self._procesar_cola)
-
-        def log_gui(self, texto: str):
-            self.ui_queue.put(("log", (texto,)))
-
-        def _append_log(self, texto: str):
-            self.log_text.config(state='normal')
-            self.log_text.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {texto}\n")
-            self.log_text.see(tk.END)
-            self.log_text.config(state='disabled')
-
-        def _actualizar_progreso(self, idx, total, copiados, eliminados, errores, archivo_actual):
-            self.progress_bar['maximum'] = total if total > 0 else 1
-            self.progress_bar['value'] = idx
-            porcentaje = int((idx / total) * 100) if total > 0 else 0
-            self.lbl_progreso.config(
-                text=f"Procesando: {porcentaje}% ({idx}/{total})  |  Copiados: {copiados}  |  Eliminados: {eliminados}  |  Errores: {errores}"
-            )
-            if archivo_actual:
-                self.lbl_archivo_actual.config(text=f"Archivo actual: {archivo_actual}")
-
-        def _toggle_pausa(self):
-            if not self.is_paused:
-                self.engine.pausar_operacion(True)
-                self.btn_pausa.config(text="▶️ Reanudar")
-                self.lbl_progreso.config(text="Estado: PAUSADO por el usuario")
-                self.is_paused = True
-            else:
-                self.engine.pausar_operacion(False)
-                self.btn_pausa.config(text="⏸️ Pausar")
-                self.is_paused = False
-
-        def _cancelar_tarea(self):
-            if messagebox.askyesno("Confirmar", "¿Desea detener la operación en curso?"):
-                self.engine.detener_operacion()
-
-        # --- Eventos Selección y Exploración ---
-        def _on_perfil_selected(self, event):
-            nombre = self.combo_perfiles.get()
-            perfil = self.config.get_perfil(nombre)
-            if perfil:
-                self.entry_ruta_origen.delete(0, tk.END)
-                self.entry_ruta_origen.insert(0, perfil.get('ruta_local', ''))
-                
-                ruta_dest = perfil.get('ruta_destino', '')
-                if not ruta_dest:
-                    dest_usb = USBDetector.buscar_proyecto_en_usb(nombre)
-                    ruta_dest = str(dest_usb) if dest_usb else str(DIR_BACKUPS / nombre / "MASTER")
-                
-                self.entry_ruta_destino.delete(0, tk.END)
-                self.entry_ruta_destino.insert(0, ruta_dest)
-
-        def _on_destino_selected(self, event):
-            nombre = self.combo_proyectos_usb.get()
-            if not nombre: return
-            cand = USBDetector.buscar_proyecto_en_usb(nombre)
-            if cand:
-                self.entry_ruta_destino.delete(0, tk.END)
-                self.entry_ruta_destino.insert(0, str(cand))
-
-        def _browse_origen(self):
-            # 'parent=self' vincula el diálogo a la ventana principal solucionando
-            # problemas de tamaño reducido o posicionamiento.
-            folder = filedialog.askdirectory(
-                parent=self, 
-                title="Selecciona Carpeta de Origen"
-            )
-            if folder:
-                self.entry_ruta_origen.delete(0, tk.END)
-                self.entry_ruta_origen.insert(0, folder)
-                nombre_sano = limpiar_nombre_ruta(Path(folder).name)
-                self.config.set_perfil(nombre_sano, Path(folder))
-                self._refresh_all()
-                self.combo_perfiles.set(nombre_sano)
-
-        def _browse_destino(self):
-            folder = filedialog.askdirectory(
-                parent=self, 
-                title="Selecciona Carpeta de Destino"
-            )
-            if folder:
-                self.entry_ruta_destino.delete(0, tk.END)
-                self.entry_ruta_destino.insert(0, folder)
-
-        def _eliminar_perfil(self):
-            nombre = self.combo_perfiles.get()
-            if nombre and messagebox.askyesno("Borrar Perfil", f"¿Eliminar el perfil '{nombre}'?"):
-                self.config.delete_perfil(nombre)
-                self._refresh_all()
-
-        # --- LÓGICA DE RESPALDO (FLECHA DERECHA) ---
-        def _ejecutar_respaldo_derecha(self):
-            origen_str = self.entry_ruta_origen.get().strip()
-            destino_str = self.entry_ruta_destino.get().strip()
-
-            if not origen_str or not Path(origen_str).exists():
-                messagebox.showerror("Error", "Seleccione una carpeta de origen válida en el panel izquierdo.")
+        if cifrar:
+            if not hacer_zip:
+                messagebox.showwarning("Atención", "El cifrado AES requiere tener marcada la opción 'Crear .ZIP'.")
                 return
-
-            if not destino_str:
-                messagebox.showerror("Error", "Seleccione una carpeta de destino en el panel derecho.")
+            if not CRYPTO_AVAILABLE:
+                messagebox.showerror("Error", "Librería PyCryptodome no instalada.")
                 return
+            password = simpledialog.askstring("Clave de Cifrado", "Introduce contraseña AES-256:", show='*')
+            if not password: return
 
-            origen = Path(origen_str)
-            destino = Path(destino_str)
-            nombre = self.combo_perfiles.get() or origen.name
+        if not messagebox.askyesno("Confirmar Respaldo", f"¿Iniciar Respaldo?\n\n• Modo: {modo.upper()}\n• Origen: {origen}\n• Destino: {destino}"):
+            return
 
-            modo = self.var_modo.get()
-            hacer_zip = self.var_hacer_zip.get()
-            cifrar = self.var_cifrar.get()
-            password = None
+        self.btn_pausa.config(state="normal")
+        self.btn_cancelar.config(state="normal")
+        self.progress_bar.stop()
+        self.progress_bar.config(mode="indeterminate")
+        self.progress_bar.start(10)
 
-            if cifrar:
-                if not hacer_zip:
-                    messagebox.showwarning("Atención", "El cifrado AES requiere tener marcada la opción 'Crear .ZIP'.")
-                    return
-                if not CRYPTO_AVAILABLE:
-                    messagebox.showerror("Error", "Librería PyCryptodome no instalada.")
-                    return
-                password = simpledialog.askstring("Clave de Cifrado", "Introduce contraseña AES-256:", show='*')
-                if not password: return
+        threading.Thread(
+            target=self._worker_respaldo,
+            args=(nombre, origen, destino, modo, password, self.config.get_opcion("compresion", 6), True, hacer_zip),
+            daemon=True
+        ).start()
 
-            if not messagebox.askyesno("Confirmar Respaldo", f"¿Iniciar Respaldo?\n\n• Modo: {modo.upper()}\n• Origen: {origen}\n• Destino: {destino}"):
-                return
+    def _worker_respaldo(self, nombre, origen, destino, modo, password, compression_level, hacer_directo, hacer_zip):
+        cambios_detallados = []
+        def cb_progreso(idx, total, cop, del_, err, arch):
+            self.ui_queue.put(("set_determinate", (total,)))
+            self.ui_queue.put(("progress", (idx, total, cop, del_, err, arch)))
 
-            self.btn_pausa.config(state="normal")
-            self.btn_cancelar.config(state="normal")
-            self.progress_bar.stop()
-            self.progress_bar.config(mode="indeterminate")
-            self.progress_bar.start(10)
+        def cb_log_custom(msg):
+            self.log_gui(msg)
+            self.ui_queue.put(("status_text", (msg,)))
+            if any(icon in msg for icon in ["➕", "📁", "🗑️", "🔄", "❌"]):
+                cambios_detallados.append(msg)
 
-            threading.Thread(
-                target=self._worker_respaldo,
-                args=(nombre, origen, destino, modo, password, self.config.get_opcion("compresion", 6), True, hacer_zip),
-                daemon=True
-            ).start()
-
-        def _worker_respaldo(self, nombre, origen, destino, modo, password, compression_level, hacer_directo, hacer_zip):
-            cambios_detallados = []
-            def cb_progreso(idx, total, cop, del_, err, arch):
-                self.ui_queue.put(("set_determinate", (total,)))
-                self.ui_queue.put(("progress", (idx, total, cop, del_, err, arch)))
-
-            def cb_log_custom(msg):
-                self.log_gui(msg)
-                self.ui_queue.put(("status_text", (msg,)))
-                if any(icon in msg for icon in ["➕", "📁", "🗑️", "🔄", "❌"]):
-                    cambios_detallados.append(msg)
-
-            try:
-                copiados, eliminados, errores = 0, 0, 0
-                if hacer_directo:
-                    es_valido, mensaje = validar_espacio_disponible(origen, destino)
-                    if not es_valido:
-                        self.ui_queue.put(("msgbox_error", ("Espacio Insuficiente", mensaje)))
-                        return
-
-                    copiados, eliminados, errores = self.engine.sincronizar(
-                        origen, destino, modo, callback_progreso=cb_progreso, callback_log=cb_log_custom
-                    )
-                    self.config.set_perfil(nombre, origen, ruta_destino=destino)
-
-                if hacer_zip and not self.engine.cancel_event.is_set():
-                    self.engine.crear_backup_zip(origen, nombre, password, compression_level, cb_log_custom)
-
-                header = f"Respaldo finalizado en '{nombre}'\nArchivos copiados: {copiados} | Eliminados: {eliminados} | Errores: {errores}"
-                detalle = "\n".join(cambios_detallados) if cambios_detallados else "Archivos sincronizados sin cambios pendientes."
-                self.ui_queue.put(("mostrar_reporte_detallado", (header, detalle)))
-
-            except Exception as e:
-                self.ui_queue.put(("msgbox_error", ("Error Crítico", f"Error durante el respaldo:\n{e}")))
-            finally:
-                self.ui_queue.put(("stop_progress", None))
-                self.ui_queue.put(("refresh", None))
-
-        # --- LÓGICA DE RESTAURACIÓN (FLECHA IZQUIERDA) ---
-        def _ejecutar_restauracion_izquierda(self):
-            origen_usb_str = self.entry_ruta_destino.get().strip()
-            destino_pc_str = self.entry_ruta_origen.get().strip()
-
-            if not origen_usb_str or not Path(origen_usb_str).exists():
-                messagebox.showerror("Error", "Seleccione una carpeta válida en el panel derecho (Destino/USB).")
-                return
-
-            if not destino_pc_str:
-                messagebox.showerror("Error", "Seleccione una carpeta de destino válida en el panel izquierdo (PC).")
-                return
-
-            origen_usb = Path(origen_usb_str)
-            destino_pc = Path(destino_pc_str)
-
-            if messagebox.askyesno("Restaurar a PC", f"¿Restaurar datos desde USB a PC?\n\n• Desde: {origen_usb}\n• Hacia: {destino_pc}"):
-                self.btn_pausa.config(state="normal")
-                self.btn_cancelar.config(state="normal")
-                threading.Thread(target=self._worker_restauracion, args=(origen_usb, destino_pc), daemon=True).start()
-
-        def _worker_restauracion(self, origen, destino):
-            self.progress_bar.config(mode="indeterminate")
-            self.progress_bar.start(10)
-            try:
-                self.log_gui("📊 Verificando espacio en PC para restauración...")
+        try:
+            copiados, eliminados, errores = 0, 0, 0
+            if hacer_directo:
                 es_valido, mensaje = validar_espacio_disponible(origen, destino)
                 if not es_valido:
-                    self.ui_queue.put(("msgbox_error", ("Espacio Insuficiente en PC", mensaje)))
+                    self.ui_queue.put(("msgbox_error", ("Espacio Insuficiente", mensaje)))
                     return
 
-                copiados, eliminados, errores = self.engine.sincronizar(origen, destino, modo="incremental", callback_log=self.log_gui)
-                self.ui_queue.put(("msgbox", ("Restauración Completada", f"Restauración terminada.\nArchivos copiados: {copiados}\nErrores: {errores}")))
-            except Exception as e:
-                self.ui_queue.put(("msgbox_error", ("Error", f"Fallo al restaurar: {e}")))
-            finally:
-                self.ui_queue.put(("stop_progress", None))
-                self.ui_queue.put(("refresh", None))
+                copiados, eliminados, errores = self.engine.sincronizar(
+                    origen, destino, modo, callback_progreso=cb_progreso, callback_log=cb_log_custom
+                )
+                self.config.set_perfil(nombre, origen, ruta_destino=destino)
 
-        # --- MODALES Y VENTANAS SECUNDARIAS ---
-        def _abrir_ventana_historial(self):
-            v = tk.Toplevel(self)
-            v.title("Historial de Copias Comprimidas (.ZIP)")
-            v.geometry("700x400")
-            
-            tree = ttk.Treeview(v, columns=("Fecha", "Tamaño", "Formato"), show="tree headings")
-            tree.heading("#0", text="Proyecto / Archivo Backup")
-            tree.heading("Fecha", text="Fecha de Creación")
-            tree.heading("Tamaño", text="Tamaño")
-            tree.heading("Formato", text="Estado Cifrado")
-            tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            if hacer_zip and not self.engine.cancel_event.is_set():
+                self.engine.crear_backup_zip(origen, nombre, password, compression_level, cb_log_custom)
 
-            if DIR_BACKUPS.exists():
-                for p in sorted(DIR_BACKUPS.iterdir()):
-                    if p.is_dir():
-                        node = tree.insert("", tk.END, text=p.name, open=True)
-                        for b in sorted(p.glob("backup_*"), key=lambda x: x.stat().st_mtime, reverse=True):
-                            if b.is_file():
-                                fecha = datetime.fromtimestamp(b.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-                                tam = formatear_tamano(b.stat().st_size)
-                                est = "🔒 Cifrado AES" if b.suffix == ".enc" else "📦 ZIP Estándar"
-                                tree.insert(node, tk.END, text=b.name, values=(fecha, tam, est))
+            header = f"Respaldo finalizado en '{nombre}'\nArchivos copiados: {copiados} | Eliminados: {eliminados} | Errores: {errores}"
+            detalle = "\n".join(cambios_detallados) if cambios_detallados else "Archivos sincronizados sin cambios pendientes."
+            self.ui_queue.put(("mostrar_reporte_detallado", (header, detalle)))
 
-        def _abrir_ventana_ajustes(self):
-            v = tk.Toplevel(self)
-            v.title("Ajustes Generales del Sistema")
-            v.geometry("500x380")
+        except Exception as e:
+            self.ui_queue.put(("msgbox_error", ("Error Crítico", f"Error durante el respaldo:\n{e}")))
+        finally:
+            self.ui_queue.put(("stop_progress", None))
+            self.ui_queue.put(("refresh", None))
 
-            f = ttk.Frame(v, padding=15)
-            f.pack(fill=tk.BOTH, expand=True)
+    def _ejecutar_restauracion_izquierda(self):
+        origen_usb_str = self.entry_ruta_destino.get().strip()
+        destino_pc_str = self.entry_ruta_origen.get().strip()
 
-            var_hash = tk.BooleanVar(value=self.config.get_opcion("verificar_hash", True))
-            ttk.Checkbutton(f, text="Verificación estricta de integridad (SHA-256)", variable=var_hash,
-                            command=lambda: self.config.set_opcion("verificar_hash", var_hash.get())).pack(anchor=tk.W, pady=5)
+        if not origen_usb_str or not Path(origen_usb_str).exists():
+            messagebox.showerror("Error", "Seleccione una carpeta válida en el panel derecho (Destino/USB).")
+            return
 
-            ttk.Label(f, text="Nivel Compresión ZIP (0-9):").pack(anchor=tk.W, pady=(10, 2))
-            spin_comp = tk.Spinbox(f, from_=0, to=9, width=5)
-            spin_comp.delete(0, tk.END)
-            spin_comp.insert(0, str(self.config.get_opcion("compresion", 6)))
-            spin_comp.pack(anchor=tk.W)
-            spin_comp.bind("<FocusOut>", lambda e: self.config.set_opcion("compresion", int(spin_comp.get())))
+        if not destino_pc_str:
+            messagebox.showerror("Error", "Seleccione una carpeta de destino válida en el panel izquierdo (PC).")
+            return
 
-            ttk.Label(f, text="Extensiones Excluidas (sep. por comas):").pack(anchor=tk.W, pady=(10, 2))
-            ent_excl = ttk.Entry(f)
-            ent_excl.insert(0, ", ".join(self.config.get_opcion("excluir_patrones", [])))
-            ent_excl.pack(fill=tk.X)
+        origen_usb = Path(origen_usb_str)
+        destino_pc = Path(destino_pc_str)
 
-            ttk.Button(f, text="Guardar Exclusiones", command=lambda: self.config.set_opcion("excluir_patrones", [x.strip() for x in ent_excl.get().split(',') if x.strip()])).pack(anchor=tk.W, pady=8)
+        if messagebox.askyesno("Restaurar a PC", f"¿Restaurar datos desde USB a PC?\n\n• Desde: {origen_usb}\n• Hacia: {destino_pc}"):
+            self.btn_pausa.config(state="normal")
+            self.btn_cancelar.config(state="normal")
+            threading.Thread(target=self._worker_restauracion, args=(origen_usb, destino_pc), daemon=True).start()
 
-        def _refresh_all(self):
-            perfiles = self.config._data.get("perfiles", {})
-            self.combo_perfiles['values'] = sorted(perfiles.keys())
-
-            proyectos_usb = set()
-            usbs = USBDetector.listar_unidades_extraibles()
-            
-            for usb in usbs:
-                # Añade la unidad directamente a la lista si no tiene subcarpetas todavía
-                proyectos_usb.add(str(usb)) 
-                
-                backup_dir = usb / "copy4me_backups"
-                if backup_dir.exists():
-                    for d in backup_dir.iterdir():
-                        if d.is_dir(): 
-                            proyectos_usb.add(d.name)
-
-            self.combo_proyectos_usb['values'] = sorted(list(proyectos_usb))
-            
-            # Si encuentra unidades pero el cuadro destino está vacío, auto-rellena con la primera USB encontrada
-            if usbs and not self.entry_ruta_destino.get().strip():
-                self.entry_ruta_destino.delete(0, tk.END)
-                self.entry_ruta_destino.insert(0, str(usbs[0]))
-                
-            self.log_gui(f"🔄 Escaneo completado. Unidades/Rutas halladas: {len(usbs)}")
-
-        def _detectar_usb(self):
-            usb = USBDetector.listar_unidades_extraibles()
-            if usb:
-                self.log_gui(f"🔌 Unidades externas conectadas: {', '.join(str(u) for u in usb)}")
-            else:
-                self.log_gui("ℹ️ No se detectaron USBs al iniciar.")
-
-        def _mostrar_ventana_reporte(self, encabezado: str, detalle: str):
-            v = tk.Toplevel(self)
-            v.title("Reporte de Cambios Realizados")
-            v.geometry("700x450")
-
-            ttk.Label(v, text=encabezado, font=self.font_bold).pack(anchor=tk.W, padx=15, pady=10)
-            txt = scrolledtext.ScrolledText(v, wrap=tk.WORD, bg="#0f172a", fg="#34d399", font=("Consolas", 9))
-            txt.insert(tk.END, detalle)
-            txt.config(state='disabled')
-            txt.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 10))
-
-        def _renombrar_perfil(self):
-            nombre_actual = self.combo_perfiles.get()
-            if not nombre_actual:
-                messagebox.showwarning("Atención", "Selecciona primero un perfil para renombrar.")
+    def _worker_restauracion(self, origen, destino):
+        self.progress_bar.config(mode="indeterminate")
+        self.progress_bar.start(10)
+        try:
+            self.log_gui("📊 Verificando espacio en PC para restauración...")
+            es_valido, mensaje = validar_espacio_disponible(origen, destino)
+            if not es_valido:
+                self.ui_queue.put(("msgbox_error", ("Espacio Insuficiente en PC", mensaje)))
                 return
 
-            # Sincronizar cola gráfica de Tkinter antes de invocar el diálogo
-            self.update_idletasks()
+            copiados, eliminados, errores = self.engine.sincronizar(origen, destino, modo="incremental", callback_log=self.log_gui)
+            self.ui_queue.put(("msgbox", ("Restauración Completada", f"Restauración terminada.\nArchivos copiados: {copiados}\nErrores: {errores}")))
+        except Exception as e:
+            self.ui_queue.put(("msgbox_error", ("Error", f"Fallo al restaurar: {e}")))
+        finally:
+            self.ui_queue.put(("stop_progress", None))
+            self.ui_queue.put(("refresh", None))
 
-            # Abrir diálogo sin forzar 'parent' estricto para evitar invalidar la ventana X11
-            nuevo_nombre = simpledialog.askstring(
-                "Renombrar Perfil", 
-                f"Introduce el nuevo nombre para '{nombre_actual}':"
-            )
+    def _abrir_ventana_historial(self):
+        v = tk.Toplevel(self)
+        v.title("Historial de Copias Comprimidas (.ZIP)")
+        v.geometry("700x400")
+        
+        tree = ttk.Treeview(v, columns=("Fecha", "Tamaño", "Formato"), show="tree headings")
+        tree.heading("#0", text="Proyecto / Archivo Backup")
+        tree.heading("Fecha", text="Fecha de Creación")
+        tree.heading("Tamaño", text="Tamaño")
+        tree.heading("Formato", text="Estado Cifrado")
+        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        if DIR_BACKUPS.exists():
+            for p in sorted(DIR_BACKUPS.iterdir()):
+                if p.is_dir():
+                    node = tree.insert("", tk.END, text=p.name, open=True)
+                    for b in sorted(p.glob("backup_*"), key=lambda x: x.stat().st_mtime, reverse=True):
+                        if b.is_file():
+                            fecha = datetime.fromtimestamp(b.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                            tam = formatear_tamano(b.stat().st_size)
+                            est = "🔒 Cifrado AES" if b.suffix == ".enc" else "📦 ZIP Estándar"
+                            tree.insert(node, tk.END, text=b.name, values=(fecha, tam, est))
+
+    def _abrir_ventana_ajustes(self):
+        v = tk.Toplevel(self)
+        v.title("Ajustes Generales del Sistema")
+        v.geometry("500x380")
+
+        f = ttk.Frame(v, padding=15)
+        f.pack(fill=tk.BOTH, expand=True)
+
+        var_hash = tk.BooleanVar(value=self.config.get_opcion("verificar_hash", True))
+        ttk.Checkbutton(f, text="Verificación estricta de integridad (SHA-256)", variable=var_hash,
+                        command=lambda: self.config.set_opcion("verificar_hash", var_hash.get())).pack(anchor=tk.W, pady=5)
+
+        ttk.Label(f, text="Nivel Compresión ZIP (0-9):").pack(anchor=tk.W, pady=(10, 2))
+        spin_comp = tk.Spinbox(f, from_=0, to=9, width=5)
+        spin_comp.delete(0, tk.END)
+        spin_comp.insert(0, str(self.config.get_opcion("compresion", 6)))
+        spin_comp.pack(anchor=tk.W)
+        spin_comp.bind("<FocusOut>", lambda e: self.config.set_opcion("compresion", int(spin_comp.get())))
+
+        ttk.Label(f, text="Extensiones Excluidas (sep. por comas):").pack(anchor=tk.W, pady=(10, 2))
+        ent_excl = ttk.Entry(f)
+        ent_excl.insert(0, ", ".join(self.config.get_opcion("excluir_patrones", [])))
+        ent_excl.pack(fill=tk.X)
+
+        ttk.Button(f, text="Guardar Exclusiones", command=lambda: self.config.set_opcion("excluir_patrones", [x.strip() for x in ent_excl.get().split(',') if x.strip()])).pack(anchor=tk.W, pady=8)
+
+    def _refresh_all(self):
+        perfiles = self.config._data.get("perfiles", {})
+        self.combo_perfiles['values'] = sorted(perfiles.keys())
+
+        proyectos_usb = set()
+        usbs = USBDetector.listar_unidades_extraibles()
+        
+        for usb in usbs:
+            proyectos_usb.add(str(usb)) 
             
-            if nuevo_nombre:
-                nuevo_nombre_sano = limpiar_nombre_ruta(nuevo_nombre)
-                if nuevo_nombre_sano == nombre_actual or not nuevo_nombre_sano:
-                    return
+            backup_dir = usb / "copy4me_backups"
+            if backup_dir.exists():
+                for d in backup_dir.iterdir():
+                    if d.is_dir(): 
+                        proyectos_usb.add(d.name)
+
+        self.combo_proyectos_usb['values'] = sorted(list(proyectos_usb))
+        
+        if usbs and not self.entry_ruta_destino.get().strip():
+            self.entry_ruta_destino.delete(0, tk.END)
+            self.entry_ruta_destino.insert(0, str(usbs[0]))
+            
+        self.log_gui(f"🔄 Escaneo completado. Unidades/Rutas halladas: {len(usbs)}")
+
+    def _detectar_usb(self):
+        usb = USBDetector.listar_unidades_extraibles()
+        if usb:
+            self.log_gui(f"🔌 Unidades externas conectadas: {', '.join(str(u) for u in usb)}")
+        else:
+            self.log_gui("ℹ️ No se detectaron USBs al iniciar.")
+
+    def _mostrar_ventana_reporte(self, encabezado: str, detalle: str):
+        v = tk.Toplevel(self)
+        v.title("Reporte de Cambios Realizados")
+        v.geometry("700x450")
+
+        ttk.Label(v, text=encabezado, font=self.font_bold).pack(anchor=tk.W, padx=15, pady=10)
+        txt = scrolledtext.ScrolledText(v, wrap=tk.WORD, bg="#0f172a", fg="#34d399", font=("Consolas", 9))
+        txt.insert(tk.END, detalle)
+        txt.config(state='disabled')
+        txt.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 10))
+
+    def _renombrar_perfil(self):
+        nombre_actual = self.combo_perfiles.get()
+        if not nombre_actual:
+            messagebox.showwarning("Atención", "Selecciona primero un perfil para renombrar.")
+            return
+
+        self.update_idletasks()
+
+        nuevo_nombre = simpledialog.askstring(
+            "Renombrar Perfil", 
+            f"Introduce el nuevo nombre para '{nombre_actual}':"
+        )
+        
+        if nuevo_nombre:
+            nuevo_nombre_sano = limpiar_nombre_ruta(nuevo_nombre)
+            if nuevo_nombre_sano == nombre_actual or not nuevo_nombre_sano:
+                return
+            
+            perfil_data = self.config.get_perfil(nombre_actual)
+            if perfil_data:
+                self.config._data["perfiles"][nuevo_nombre_sano] = perfil_data
+                self.config.delete_perfil(nombre_actual)
                 
-                # Modificar diccionario de perfiles
-                perfil_data = self.config.get_perfil(nombre_actual)
-                if perfil_data:
-                    self.config._data["perfiles"][nuevo_nombre_sano] = perfil_data
-                    self.config.delete_perfil(nombre_actual)
-                    
-                    # Sincronizar eventos pendientes
-                    self.update_idletasks()
-                    
-                    # Refrescar UI
-                    self._refresh_all()
-                    self.combo_perfiles.set(nuevo_nombre_sano)
-                    
-                    # Registrar el log en consola en lugar de un modal propenso a errores en Wayland
-                    self.log_gui(f"✏️ Perfil '{nombre_actual}' renombrado a '{nuevo_nombre_sano}'")
+                self.update_idletasks()
+                self._refresh_all()
+                self.combo_perfiles.set(nuevo_nombre_sano)
+                self.log_gui(f"✏️ Perfil '{nombre_actual}' renombrado a '{nuevo_nombre_sano}'")
 
 def modo_tui():
     config = ConfigManager()
@@ -1243,13 +1219,8 @@ def modo_tui():
 
         opc = input("Selecciona una opción [0-6]: ").strip()
 
-        # ==============================================================================
-        # 1. REALIZAR SINCRONIZACIÓN / RESPALDO
-        # ==============================================================================
         if opc == "1":
             print("\n--- RESPALDO DE DATOS ---")
-            
-            # Gestión de perfiles previos
             perfiles = config._data.get("perfiles", {})
             nombre_perfil = ""
             origen_str = ""
@@ -1269,7 +1240,6 @@ def modo_tui():
                     origen_str = p_data.get('ruta_local', '')
                     destino_str = p_data.get('ruta_destino', '')
 
-            # Si no se seleccionó perfil, pedir Origen
             if not origen_str:
                 origen_str = input("\nRuta Carpeta ORIGEN (PC): ").strip()
                 if not origen_str:
@@ -1282,7 +1252,6 @@ def modo_tui():
                 print(f"❌ Error: La ruta de origen '{origen_str}' no existe.")
                 continue
 
-            # Selección/Verificación de Destino
             if not destino_str:
                 usbs = USBDetector.listar_unidades_extraibles()
                 if usbs:
@@ -1304,7 +1273,6 @@ def modo_tui():
 
             destino_path = Path(destino_str)
 
-            # Selección de Modo
             print("\nModos de Sincronización:")
             print("  [1] incremental   | Copia solo archivos nuevos o modificados")
             print("  [2] espejo        | Borra en destino lo eliminado en origen")
@@ -1313,21 +1281,16 @@ def modo_tui():
             
             modo = "espejo" if m_opc == "2" else ("bidireccional" if m_opc == "3" else "incremental")
 
-            # Validar espacio
             is_valid, msg = validar_espacio_disponible(origen_path, destino_path)
             if not is_valid:
                 print(f"❌ Error: {msg}")
                 continue
 
-            # Sincronización y guardado de perfil
             print("\n🚀 Iniciando proceso...")
             engine.sincronizar(origen_path, destino_path, modo=modo, callback_log=log_tui)
             config.set_perfil(nombre_perfil, origen_path, destino_path)
             print("✔ Perfil actualizado y sincronización finalizada.")
 
-        # ==============================================================================
-        # 2. GESTIONAR PERFILES GUARDADOS
-        # ==============================================================================
         elif opc == "2":
             print("\n--- GESTIÓN DE PERFILES ---")
             perfiles = config._data.get("perfiles", {})
@@ -1354,9 +1317,6 @@ def modo_tui():
                 else:
                     print("❌ Selección no válida.")
 
-        # ==============================================================================
-        # 3. ESCANEAR UNIDADES EXTERNAS / USB
-        # ==============================================================================
         elif opc == "3":
             print("\n--- DETECCIÓN DE UNIDADES EXTERNAS / USB ---")
             usbs = USBDetector.listar_unidades_extraibles()
@@ -1369,9 +1329,6 @@ def modo_tui():
                     if backups.exists():
                         print(f"   └─ 📂 Proyectos dentro: {[d.name for d in backups.iterdir() if d.is_dir()]}")
 
-        # ==============================================================================
-        # 4. RESTAURAR DATOS (DESTINO -> ORIGEN)
-        # ==============================================================================
         elif opc == "4":
             print("\n--- RESTAURACIÓN DE DATOS ---")
             origen_str = input("Ruta Carpeta ORIGEN (Respaldo en USB/Disco): ").strip()
@@ -1393,9 +1350,6 @@ def modo_tui():
             engine.sincronizar(Path(origen_str), Path(destino_str), modo="incremental", callback_log=log_tui)
             print("✔ Restauración finalizada.")
 
-        # ==============================================================================
-        # 5. CREAR BACKUP .ZIP COMPRIMIDO / CIFRADO
-        # ==============================================================================
         elif opc == "5":
             print("\n--- RESPALDO COMPRIMIDO (.ZIP) ---")
             origen_str = input("Ruta Carpeta a Comprimir: ").strip()
@@ -1419,9 +1373,6 @@ def modo_tui():
             comp = config.get_opcion("compresion", 6)
             engine.crear_backup_zip(Path(origen_str), nombre, password=password, compression_level=comp, callback_log=log_tui)
 
-        # ==============================================================================
-        # 6. CONFIGURACIÓN Y OPICONES
-        # ==============================================================================
         elif opc == "6":
             print("\n--- CONFIGURACIÓN DEL SISTEMA ---")
             hash_val = config.get_opcion("verificar_hash", True)
@@ -1435,20 +1386,13 @@ def modo_tui():
                 config.set_opcion("verificar_hash", not hash_val)
                 print(f"✔ Verificación SHA-256 cambiada a: {not hash_val}")
 
-        # ==============================================================================
-        # 0. SALIR
-        # ==============================================================================
         elif opc == "0":
             print("👋 Saliendo de Copy4Me Terminal Engine...")
             break
         else:
             print("❌ Opción no válida. Intente nuevamente.")
 
-
-# ==============================================================================
-#           PUNTO DE ENTRADA Y CONTROL DE MODO DE EJECUCIÓN
-# ==============================================================================
-
+# --- PUNTO DE ENTRADA ---
 if __name__ == "__main__":
     if platform.system() == "Linux":
         os.environ["TK_SILENT_ERROR"] = "1"
