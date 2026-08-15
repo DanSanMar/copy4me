@@ -49,7 +49,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "5.2"
+VERSION = "5.2.1"
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -584,7 +584,8 @@ class SyncEngine:
     def crear_backup_zip(self, carpeta_origen: Path, nombre_proyecto: str,
                          password: Optional[str] = None,
                          compression_level: int = DEFAULT_COMPRESSION_LEVEL,
-                         callback_log: Optional[Callable] = None) -> Optional[Path]:
+                         callback_log: Optional[Callable] = None,
+                         callback_progreso: Optional[Callable] = None) -> Optional[Path]:
         if not carpeta_origen.exists():
             if callback_log: callback_log("❌ Error: Origen no existe.")
             return None
@@ -600,39 +601,74 @@ class SyncEngine:
         nombre_zip = f"backup_{proyecto_sano}_{host_sano}_{fecha}.zip"
         ruta_zip = carpeta_backups / nombre_zip
 
-        if callback_log: callback_log(f"📦 Generando paquete comprimido: {ruta_zip.name}")
+        if callback_log: 
+            callback_log(f"📦 Analizando archivos para comprimir...")
 
         try:
+            # 1. Escanear y contar archivos previamente
+            archivos_a_procesar = []
+            for root, dirs, files in os.walk(carpeta_origen):
+                if self.cancel_event.is_set(): return None
+                dirs[:] = [d for d in dirs if not self._excluir_archivo(Path(root) / d)]
+                for f in files:
+                    p = Path(root) / f
+                    if not self._excluir_archivo(p): 
+                        archivos_a_procesar.append(p)
+
+            total_archivos = len(archivos_a_procesar)
+            if callback_log: 
+                callback_log(f"📦 Empaquetando {total_archivos} archivos en: {ruta_zip.name}")
+
+            manifest = {"version": VERSION, "fecha": datetime.now().isoformat(), "origen": str(carpeta_origen), "archivos": {}}
+            
+            # Calcular Hashes si está activo
+            hashes = SecurityUtils.calcular_hashes_paralelo(archivos_a_procesar) if self.config.get_opcion("verificar_hash", True) else {}
+
+            # 2. Comprimir y reportar avance archivo por archivo
             with zipfile.ZipFile(ruta_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=compression_level) as zf:
-                manifest = {"version": VERSION, "fecha": datetime.now().isoformat(), "origen": str(carpeta_origen), "archivos": {}}
-                archivos_a_procesar = []
-                for root, dirs, files in os.walk(carpeta_origen):
-                    dirs[:] = [d for d in dirs if not self._excluir_archivo(Path(root) / d)]
-                    for f in files:
-                        p = Path(root) / f
-                        if not self._excluir_archivo(p): archivos_a_procesar.append(p)
+                for idx, r in enumerate(archivos_a_procesar, 1):
+                    if self.cancel_event.is_set():
+                        if callback_log: callback_log("🛑 Compresión .ZIP cancelada por el usuario.")
+                        break
 
-                hashes = SecurityUtils.calcular_hashes_paralelo(archivos_a_procesar) if self.config.get_opcion("verificar_hash", True) else {}
+                    while not self.pause_event.is_set():
+                        if self.cancel_event.is_set(): break
+                        time.sleep(0.1)
 
-                for r in archivos_a_procesar:
                     arcname = str(r.relative_to(carpeta_origen))
                     zf.write(r, arcname)
                     manifest["archivos"][arcname] = {"size": r.stat().st_size, "hash": hashes.get(r, "")}
 
-                zf.writestr("manifest_backup.json", json.dumps(manifest, indent=4))
+                    # Enviar avance en tiempo real a la interfaz
+                    if callback_progreso:
+                        callback_progreso(idx, total_archivos, idx, 0, 0, f"Comprimiendo: {arcname}")
 
+                if not self.cancel_event.is_set():
+                    zf.writestr("manifest_backup.json", json.dumps(manifest, indent=4))
+
+            if self.cancel_event.is_set():
+                if ruta_zip.exists():
+                    try: ruta_zip.unlink()
+                    except Exception: pass
+                return None
+
+            # 3. Cifrado opcional con reporte visual
             if password and CRYPTO_AVAILABLE:
+                if callback_log: callback_log("🔒 Aplicando cifrado AES-256 al paquete...")
                 ruta_cifrada = ruta_zip.with_suffix(".zip.enc")
-                if SecurityUtils.cifrar_archivo(ruta_zip, ruta_cifrada, password):
+                if SecurityUtils.cifrar_archivo(ruta_zip, ruta_cifrada, password, self.cancel_event):
                     ruta_zip.unlink()
                     ruta_zip = ruta_cifrada
-                    if callback_log: callback_log("🔒 Paquete cifrado con AES-256")
-                else: raise RuntimeError("Error cifrando con AES.")
+                    if callback_log: callback_log("🔒 Paquete cifrado exitosamente con AES-256")
+                else: 
+                    raise RuntimeError("Error cifrando el archivo ZIP.")
 
-            if callback_log: callback_log(f"✅ Backup .ZIP listo: {ruta_zip.name}")
+            if callback_log: callback_log(f"✅ Backup .ZIP completado: {ruta_zip.name}")
             return ruta_zip
+
         except Exception as e:
             logger.error(f"Error creando backup zip: {e}")
+            if callback_log: callback_log(f"❌ Error en compresión ZIP: {e}")
             if ruta_zip.exists():
                 try: ruta_zip.unlink()
                 except Exception: pass
@@ -1028,7 +1064,11 @@ class Copy4MeGUI(BaseTk):
                 self.config.set_perfil(nombre, origen, ruta_destino=destino)
 
             if hacer_zip and not self.engine.cancel_event.is_set():
-                self.engine.crear_backup_zip(origen, nombre, password, compression_level, cb_log_custom)
+                self.engine.crear_backup_zip(
+                    origen, nombre, password, compression_level, 
+                    callback_log=cb_log_custom, 
+                    callback_progreso=cb_progreso
+                )
 
             header = f"Respaldo finalizado en '{nombre}'\nArchivos copiados: {copiados} | Eliminados: {eliminados} | Errores: {errores}"
             detalle = "\n".join(cambios_detallados) if cambios_detallados else "Archivos sincronizados sin cambios pendientes."
