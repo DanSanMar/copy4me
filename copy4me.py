@@ -21,6 +21,112 @@ import tempfile
 import getpass
 from concurrent.futures import ThreadPoolExecutor
 
+def detectar_gestor_paquetes() -> tuple[str, list[str]]:
+    """Detecta el sistema operativo y el gestor de paquetes disponible."""
+    sistema = platform.system()
+    
+    if sistema == "Linux":
+        if shutil.which("pacman"):
+            return "arch", ["sudo", "pacman", "-S", "--noconfirm"]
+        elif shutil.which("apt"):
+            return "debian", ["sudo", "apt", "update", "&&", "sudo", "apt", "install", "-y"]
+        elif shutil.which("dnf"):
+            return "fedora", ["sudo", "dnf", "install", "-y"]
+        elif shutil.which("zypper"):
+            return "suse", ["sudo", "zypper", "install", "-y"]
+    elif sistema == "Darwin":
+        if shutil.which("brew"):
+            return "mac", ["brew", "install"]
+    elif sistema == "Windows":
+        return "windows", [sys.executable, "-m", "pip", "install"]
+        
+    return "desconocido", []
+
+def verificar_y_ofrecer_instalacion():
+    """Comprueba dependencias del sistema y ofrece instalarlas automáticamente."""
+    faltantes_pip = []
+    faltantes_sistema = []
+
+    # 1. Comprobar Tkinter (Interfaz Gráfica)
+    try:
+        import tkinter
+    except ImportError:
+        faltantes_sistema.append("tkinter")
+
+    # 2. Comprobar PyCryptodome (Cifrado AES)
+    try:
+        import Crypto
+    except ImportError:
+        faltantes_pip.append("pycryptodome")
+
+    # 3. Comprobar fuentes Emoji en Linux (Pacman / Apt / Dnf)
+    distro, comando_base = detectar_gestor_paquetes()
+    if distro == "arch":
+        # Verificamos si existe la fuente noto-fonts-emoji mediante fc-list
+        if shutil.which("fc-list"):
+            res = subprocess.run(["fc-list", ":family=Noto Color Emoji"], capture_output=True, text=True)
+            if not res.stdout.strip():
+                faltantes_sistema.append("noto-fonts-emoji")
+
+    # Si no falta nada, continuamos normalmente
+    if not faltantes_pip and not faltantes_sistema:
+        return True
+
+    # --- Notificar al usuario las dependencias faltantes ---
+    print("\n" + "="*60)
+    print(" ⚠️  DETECCIÓN DE DEPENDENCIAS FALTANTES")
+    print("="*60)
+    if faltantes_sistema:
+        print(f" • Paquetes del sistema requeridos: {', '.join(faltantes_sistema)}")
+    if faltantes_pip:
+        print(f" • Librerías Python requeridas    : {', '.join(faltantes_pip)}")
+    print("="*60)
+
+    respuesta = input("\n¿Deseas intentar instalar las dependencias automáticamente? (s/n): ").strip().lower()
+
+    if respuesta != 's':
+        print("\nℹ️  Instalación omitida. Se ejecutará en Modo Consola (TUI).\n")
+        return False
+
+    # --- Proceso de Instalación Automática ---
+    try:
+        # A. Instalación de paquetes del sistema
+        if faltantes_sistema and comando_base:
+            pkgs_traducidos = []
+            for pkg in faltantes_sistema:
+                if distro == "arch":
+                    if pkg == "tkinter": pkgs_traducidos.append("tk")
+                    else: pkgs_traducidos.append(pkg)
+                elif distro == "debian":
+                    if pkg == "tkinter": pkgs_traducidos.append("python3-tk")
+                    elif pkg == "noto-fonts-emoji": pkgs_traducidos.append("fonts-noto-color-emoji")
+                elif distro == "fedora":
+                    if pkg == "tkinter": pkgs_traducidos.append("python3-tkinter")
+                    elif pkg == "noto-fonts-emoji": pkgs_traducidos.append("google-noto-emoji-fonts")
+
+            if pkgs_traducidos:
+                print(f"\n🚀 Instalando paquetes del sistema mediante {distro.upper()}...")
+                cmd = comando_base + pkgs_traducidos
+                subprocess.run(" ".join(cmd) if distro == "debian" else cmd, shell=(distro == "debian"), check=True)
+
+        # B. Instalación de paquetes PIP
+        if faltantes_pip:
+            print(f"\n🚀 Instalando paquetes Python ({', '.join(faltantes_pip)})...")
+            cmd_pip = [sys.executable, "-m", "pip", "install"] + faltantes_pip
+            subprocess.run(cmd_pip, check=True)
+
+        print("\n✅ ¡Todas las dependencias se instalaron correctamente!")
+        input("Presiona ENTER para reiniciar el programa e iniciar la interfaz gráfica...")
+        
+        # Reiniciar el script para cargar los nuevos paquetes instalados
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    except Exception as e:
+        print(f"\n❌ Error al intentar instalar dependencias: {e}")
+        print("🔄 Se iniciará en Modo Terminal (TUI)...\n")
+        time.sleep(2)
+        return False
+
 # Activar alta densidad de píxeles (High DPI) en Windows
 if platform.system() == "Windows":
     try:
@@ -49,7 +155,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "5.4.2" #prueba de copia a espejo, cambio en el orden de eliminar primero y copiar después.
+VERSION = "5.4.3" #prueba de copia a espejo, cambio en el orden de eliminar primero y copiar después.
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -874,12 +980,23 @@ class Copy4MeGUI(BaseTk):
         self.style.theme_use('clam')
         self.configure(bg="#f8fafc")
 
-        self.font_title = ("Segoe UI", 12, "bold")
-        self.font_sub = ("Segoe UI", 10, "italic")
-        self.font_bold = ("Segoe UI", 11, "bold")
-        self.font_norm = ("Segoe UI", 11)
-        self.font_big_btn = ("Segoe UI", 11, "bold")
+        # --- 1. CONFIGURACIÓN DE FUENTES (Tamaños incrementados) ---
+        # Cambiamos los tamaños base: Normal pasa de 11 a 13, Títulos a 14, etc.
+        TAMAÑO_BASE = 15
+        
+        self.font_title = ("Segoe UI", TAMAÑO_BASE + 2, "bold")
+        self.font_sub = ("Segoe UI", TAMAÑO_BASE - 1, "italic")
+        self.font_bold = ("Segoe UI", TAMAÑO_BASE, "bold")
+        self.font_norm = ("Segoe UI", TAMAÑO_BASE)
+        self.font_big_btn = ("Segoe UI", TAMAÑO_BASE, "bold")
+        self.font_code = ("Consolas", TAMAÑO_BASE)
 
+        # Configurar la fuente por defecto para las ventanas de opción emergentes (OptionMenu/Popups)
+        self.option_add("*Font", self.font_norm)
+        # Configurar la fuente interna de las listas desplegables cuando se abren (Listbox emergente de Combobox)
+        self.option_add("*TCombobox*Listbox.font", self.font_norm)
+
+        # --- 2. APLICACIÓN DE ESTILOS A COMPONENTES TTK ---
         self.style.configure('TLabelframe', background="#ffffff", relief="solid", borderwidth=1, bordercolor="#cbd5e1")
         self.style.configure('TLabelframe.Label', font=self.font_title, foreground="#0f172a", background="#ffffff")
         self.style.configure('TFrame', background="#f8fafc")
@@ -887,9 +1004,16 @@ class Copy4MeGUI(BaseTk):
         self.style.configure('TRadiobutton', background="#ffffff", font=self.font_norm)
         self.style.configure('TCheckbutton', background="#ffffff", font=self.font_norm)
         
-        self.style.configure('TButton', font=self.font_norm, padding=6)
-        self.style.configure('TCombobox', font=self.font_norm, padding=4)
-        self.style.configure('TEntry', font=self.font_norm, padding=4)
+        # Botones y Entradas de texto
+        self.style.configure('TButton', font=self.font_bold, padding=8)
+        self.style.configure('TEntry', font=self.font_norm, padding=6)
+
+        # Desplegables (Combobox): Fuente del campo principal + tamaño de la caja desplegable
+        self.style.configure('TCombobox', font=self.font_norm, padding=6)
+        
+        # Tablas (Treeview - Usado en la ventana de historial)
+        self.style.configure('Treeview', font=self.font_norm, rowheight=30)
+        self.style.configure('Treeview.Heading', font=self.font_bold)
 
     def _crear_interfaz_dividida(self):
         top_bar = ttk.Frame(self, padding=(15, 8))
@@ -901,8 +1025,8 @@ class Copy4MeGUI(BaseTk):
         btn_tools.pack(side=tk.RIGHT)
         
         ttk.Button(btn_tools, text="🔍 Historial Backups", command=self._abrir_ventana_historial).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_tools, text="⚙️ Ajustes", command=self._abrir_ventana_ajustes).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_tools, text="🔌 Refrescar USB", command=self._refresh_all).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_tools, text="⚙ Ajustes", command=self._abrir_ventana_ajustes).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_tools, text="🔄 Refrescar USB", command=self._refresh_all).pack(side=tk.LEFT, padx=3)
 
         main_split = ttk.Frame(self, padding=(10, 0, 10, 5))
         main_split.pack(fill=tk.BOTH, expand=False)
@@ -922,7 +1046,7 @@ class Copy4MeGUI(BaseTk):
         row_btn_orig = ttk.Frame(card_origen)
         row_btn_orig.pack(fill=tk.X, pady=3)
         ttk.Button(row_btn_orig, text="📁 Explorar PC...", command=self._browse_origen).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        ttk.Button(row_btn_orig, text="✏️ Renombrar", command=self._renombrar_perfil).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row_btn_orig, text="✏ Renombrar", command=self._renombrar_perfil).pack(side=tk.LEFT, padx=2)
         ttk.Button(row_btn_orig, text="❌ Borrar", command=self._eliminar_perfil).pack(side=tk.RIGHT, padx=2)
 
         ttk.Label(card_origen, text="Ruta de Origen Seleccionada:", font=self.font_bold).pack(anchor=tk.W, pady=(10, 2))
@@ -938,17 +1062,17 @@ class Copy4MeGUI(BaseTk):
         row_modo_header.pack(pady=(5, 2))
 
         ttk.Label(row_modo_header, text="Modo de Operación:", font=self.font_bold).pack(side=tk.LEFT)
-        btn_info_modos = ttk.Button(row_modo_header, text="ℹ️", width=3, command=self._mostrar_info_modos)
+        btn_info_modos = ttk.Button(row_modo_header, text="i", width=3, command=self._mostrar_info_modos)
         btn_info_modos.pack(side=tk.LEFT, padx=(5, 0))
 
         self.var_modo = tk.StringVar(value="incremental")
         combo_modo = ttk.Combobox(card_centro, textvariable=self.var_modo, values=["incremental", "espejo", "bidireccional"], state="readonly", width=14)
         combo_modo.pack(pady=(0, 10))
 
-        btn_copiar_der = ttk.Button(card_centro, text=" RESPALDAR ➡️\n  (Origen ➔ Destino)", command=self._ejecutar_respaldo_derecha)
+        btn_copiar_der = ttk.Button(card_centro, text=" RESPALDAR ►\n  (Origen → Destino)", command=self._ejecutar_respaldo_derecha)
         btn_copiar_der.pack(fill=tk.X, pady=6)
 
-        btn_copiar_izq = ttk.Button(card_centro, text=" ⬅️ RESTAURAR\n  (Destino ➔ Origen)", command=self._ejecutar_restauracion_izquierda)
+        btn_copiar_izq = ttk.Button(card_centro, text=" ◄ RESTAURAR\n  (Destino → Origen)", command=self._ejecutar_restauracion_izquierda)
         btn_copiar_izq.pack(fill=tk.X, pady=6)
 
         box_opciones = ttk.LabelFrame(card_centro, text=" Opciones ", padding=5)
@@ -996,7 +1120,7 @@ class Copy4MeGUI(BaseTk):
         self.btn_cancelar = ttk.Button(ctrl_row, text="🛑 Cancelar", command=self._cancelar_tarea, state="disabled")
         self.btn_cancelar.pack(side=tk.RIGHT, padx=2)
 
-        self.btn_pausa = ttk.Button(ctrl_row, text="⏸️ Pausar", command=self._toggle_pausa, state="disabled")
+        self.btn_pausa = ttk.Button(ctrl_row, text="⏸ Pausar", command=self._toggle_pausa, state="disabled")
         self.btn_pausa.pack(side=tk.RIGHT, padx=2)
 
         self.lbl_archivo_actual = ttk.Label(status_frame, text="", font=self.font_sub)
@@ -1759,10 +1883,19 @@ def modo_tui():
         else:
             print("❌ Opción no válida. Intente nuevamente.")
 
-# --- PUNTO DE ENTRADA ---
 if __name__ == "__main__":
     if platform.system() == "Linux":
         os.environ["TK_SILENT_ERROR"] = "1"
+
+    # Verificar e instalar dependencias si el usuario lo desea
+    deps_ok = verificar_y_ofrecer_instalacion()
+
+    # Re-evaluar disponibilidad de GUI tras el chequeo
+    try:
+        import tkinter
+        GUI_DISPONIBLE = True
+    except ImportError:
+        GUI_DISPONIBLE = False
 
     tiene_display = (
         platform.system() == "Windows" or 
@@ -1770,20 +1903,15 @@ if __name__ == "__main__":
         bool(os.environ.get('WAYLAND_DISPLAY', ''))
     )
 
-    if GUI_AVAILABLE and tiene_display:
+    if GUI_DISPONIBLE and tiene_display and deps_ok:
         try:
             app = Copy4MeGUI()
             app.tk.call('tk', 'scaling', 1.2)
             app.mainloop()
         except Exception as e:
             print(f"⚠️ No se pudo iniciar la interfaz gráfica ({e}).")
-            print("🔄 Cambiando automáticamente a modo Terminal (TUI)...\n")
+            print("🔄 Cambiando a modo Terminal (TUI)...\n")
             modo_tui()
     else:
-        if not GUI_AVAILABLE:
-            print("ℹ️ Librería gráfica (Tkinter) no detectada.")
-        elif not tiene_display:
-            print("ℹ️ Entorno sin pantalla gráfica detectado (SSH/Servidor).")
-            
         print("🚀 Iniciando Copy4Me en Modo Terminal (TUI)...\n")
         modo_tui()
