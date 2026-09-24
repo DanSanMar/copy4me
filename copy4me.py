@@ -49,7 +49,7 @@ except ImportError:
     GUI_AVAILABLE = False
 
 # --- Constantes y Configuración Global ---
-VERSION = "5.4.1"
+VERSION = "5.4.2" #prueba de copia a espejo, cambio en el orden de eliminar primero y copiar después.
 APP_NAME = "Copy4Me"
 MAX_BACKUPS = 10
 EXCLUDE_DIRS = {
@@ -586,6 +586,45 @@ class SyncEngine:
         # =========================================================
         # MODOS INCREMENTAL Y ESPEJO
         # =========================================================
+        
+        # 1. LIMPIEZA EN MODO ESPEJO (Ocurre PRIMERO para evitar conflictos de renombrado/movimiento)
+        if modo == "espejo" and destino.exists() and not self.cancel_event.is_set():
+            for root, dirs, files in os.walk(destino, topdown=False):
+                if self.cancel_event.is_set(): break
+                
+                # A. Eliminar archivos en destino que ya no existen en origen
+                for f in files:
+                    r_dst = Path(root) / f
+                    rel = r_dst.relative_to(destino)
+                    
+                    # Verificación insensible a mayúsculas/minúsculas para evitar falsos positivos
+                    src_equivalent = origen / rel
+                    
+                    if not src_equivalent.exists():
+                        try:
+                            r_dst.unlink()
+                            eliminados += 1
+                            if callback_log: callback_log(f"🗑️ Eliminado en destino (Espejo): {rel}")
+                        except Exception as e:
+                            logger.warning(f"Error eliminando archivo {r_dst}: {e}")
+                            errores += 1
+
+                # B. Eliminar carpetas en destino que ya no existen en origen
+                for d in dirs:
+                    r_dir_dst = Path(root) / d
+                    rel_dir = r_dir_dst.relative_to(destino)
+                    src_dir_corr = origen / rel_dir
+
+                    if not src_dir_corr.exists():
+                        try:
+                            r_dir_dst.rmdir()
+                            eliminados += 1
+                            if callback_log: callback_log(f"🗑️ Carpeta eliminada en destino (Espejo): {rel_dir}")
+                        except OSError:
+                            # Se ignora si no está vacía aún o falla por permisos
+                            pass
+
+        # 2. ESCANEAR ORIGEN Y COPIAR / ACTUALIZAR ARCHIVOS EN DESTINO
         archivos_origen = []
         directorios_origen = []
 
@@ -633,40 +672,6 @@ class SyncEngine:
                 if estado != "cancelado": 
                     errores += 1
                     if callback_log: callback_log(f"❌ Error al copiar: {rel}")
-
-        # Limpieza Estricta en Modo Espejo (Archivos y Carpetas sobrantes)
-        if modo == "espejo" and destino.exists() and not self.cancel_event.is_set():
-            # Usamos topdown=False para procesar las subcarpetas antes que sus padres
-            for root, dirs, files in os.walk(destino, topdown=False):
-                if self.cancel_event.is_set(): break
-                
-                # 1. Eliminar archivos que ya no existen en origen
-                for f in files:
-                    r_dst = Path(root) / f
-                    rel = r_dst.relative_to(destino)
-                    if not (origen / rel).exists():
-                        try:
-                            r_dst.unlink()
-                            eliminados += 1
-                            if callback_log: callback_log(f"🗑️ Eliminado en destino (Espejo): {rel}")
-                        except Exception:
-                            errores += 1
-
-                # 2. Eliminar directorios vacíos o que no existen en origen
-                for d in dirs:
-                    r_dir_dst = Path(root) / d
-                    rel_dir = r_dir_dst.relative_to(destino)
-                    src_dir_corr = origen / rel_dir
-
-                    if not src_dir_corr.exists():
-                        try:
-                            # Intentar eliminar la carpeta (solo funcionará si está vacía)
-                            r_dir_dst.rmdir()
-                            eliminados += 1
-                            if callback_log: callback_log(f"🗑️ Carpeta eliminada en destino (Espejo): {rel_dir}")
-                        except OSError:
-                            # Si no está vacía o hay error de permisos
-                            pass
 
         if callback_log:
             callback_log(f"✅ Finalizado. Copiados: {copiados}, Eliminados: {eliminados}, Errores: {errores}")
